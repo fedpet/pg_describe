@@ -1,24 +1,49 @@
 # pg-describe-gen
 
-Generate TypeScript types from plain `.sql` files, using the
-[`pg_describe`](https://github.com/sajonaro/pg_describe) PostgreSQL extension.
+[![npm](https://img.shields.io/npm/v/pg-describe-gen)](https://www.npmjs.com/package/pg-describe-gen)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/sajonaro/pg_describe/blob/main/LICENSE)
 
-Your query files stay **valid SQL** — native `$1` placeholders, no dialect to
-learn — so the file you generate types from is a file you can paste straight
-into `psql`.
+**Generate TypeScript types from plain `.sql` files, using the
+[`pg_describe`](https://github.com/sajonaro/pg_describe) PostgreSQL extension.**
+
+Query files stay valid SQL — native `$1` placeholders, no dialect — so the file
+you generate types from is a file you can paste straight into `psql`. Types come
+from the database itself: each statement is parsed and analysed by PostgreSQL,
+and none of them is executed.
+
+## Features
+
+- **Types the database vouches for**, not a hand-maintained model of it.
+- **Outer-join-aware nullability**: a column on the nullable side of a
+  `LEFT JOIN` is typed `T | null` even when it is declared `NOT NULL` — the case
+  most generators get wrong.
+- **Inferred parameter types.** Nothing declares them.
+- **`--check` mode for CI**: exit 1 when the committed output no longer matches
+  the database, so a breaking migration fails the pull request, not the deploy.
+- **SQL comments become JSDoc**, so a query documents itself at the call site.
+- **Configurable type mapping** with defaults that match what node-postgres
+  actually returns.
+
+## Documentation
+
+Full documentation: **https://sajonaro.github.io/pg_describe/**
+
+- [CLI usage and configuration](https://sajonaro.github.io/pg_describe/cli-configuration)
+- [Queries in SQL files](https://sajonaro.github.io/pg_describe/queries-in-sql-files)
+- [Generated code](https://sajonaro.github.io/pg_describe/generated-code)
+- [Type mapping](https://sajonaro.github.io/pg_describe/type-mapping)
+- [Nullability](https://sajonaro.github.io/pg_describe/nullability)
 
 ## Requires
 
 - PostgreSQL with `pg_describe` installed (`CREATE EXTENSION pg_describe;`)
 - Node 18+
 
-## Install
+## Getting started
 
 ```bash
 npm install --save-dev pg-describe-gen
 ```
-
-## Use
 
 **1. Write queries, annotated with a name.**
 
@@ -31,14 +56,7 @@ SELECT o.id, o.total, c.email
 FROM orders o
 LEFT JOIN customers c ON c.id = o.customer_id
 WHERE o.placed_at >= $1;
-
--- @name CreateOrder
-INSERT INTO orders (customer_id, total) VALUES ($1, $2)
-RETURNING id, placed_at;
 ```
-
-The comment block between `@name` and the statement becomes the generated
-function's JSDoc. Several queries per file are fine.
 
 **2. Configure.**
 
@@ -50,12 +68,10 @@ function's JSDoc. Several queries per file are fine.
 }
 ```
 
-`queries` is a directory, scanned recursively for `.sql` files.
-
-Connection settings are deliberately *not* in this file — the generator uses
+Connection settings are deliberately not in this file — the generator uses
 node-postgres, which reads `DATABASE_URL` or the standard `PGHOST` / `PGPORT` /
-`PGUSER` / `PGPASSWORD` / `PGDATABASE` variables. Credentials stay out of a file
-you want to commit.
+`PGUSER` / `PGPASSWORD` / `PGDATABASE` variables, so credentials stay out of a
+file you commit.
 
 **3. Generate.**
 
@@ -71,7 +87,7 @@ export interface ListRecentOrdersParams {
 export interface ListRecentOrdersRow {
   id: string            // orders.id
   total: string         // orders.total
-  email: string | null  // customers.email
+  email: string | null  // customers.email — NOT NULL, but LEFT JOINed
 }
 
 /**
@@ -83,62 +99,28 @@ export async function listRecentOrders(
 ): Promise<ListRecentOrdersRow[]>
 ```
 
-A statement with no `RETURNING` generates a function returning `Promise<number>`
-— the affected row count — instead of a row array.
-
-## In CI
+**4. Check it in CI.**
 
 ```bash
 npx pg-describe-gen --check
 ```
 
-Exits 1 if the committed output no longer matches what the database says. A
-schema change that breaks a query then fails the build instead of the deploy.
+[`examples/typescript`](https://github.com/sajonaro/pg_describe/tree/main/examples/typescript)
+is a complete runnable project.
 
-## Type mapping
+## Credit
 
-| PostgreSQL | TypeScript | |
-|---|---|---|
-| `smallint`, `integer`, `real`, `double precision` | `number` | |
-| `bigint` | `string` | an int8 does not fit in a JS number; node-postgres returns a string |
-| `numeric`, `decimal` | `string` | arbitrary precision, and floats are wrong for money |
-| `boolean` | `boolean` | |
-| `text`, `varchar`, `char`, `uuid`, `citext`, `inet`, `interval` | `string` | |
-| `date`, `timestamp`, `timestamptz` | `Date` | |
-| `time`, `time with time zone` | `string` | no `Date` equivalent |
-| `bytea` | `Buffer` | |
-| `json`, `jsonb` | `unknown` | narrow it yourself |
-| `T[]` | `T[]` | any dimension |
-| anything else | `unknown` | with a warning |
+The idea is taken from [pgTyped](https://github.com/adelsz/pgtyped) by
+[Adel Salakh](https://github.com/adelsz), which demonstrated that TypeScript
+types for SQL can come from a live PostgreSQL database rather than from a
+hand-maintained model of it. [`sqlc`](https://sqlc.dev) and
+[`sqlx`](https://github.com/launchbadge/sqlx) do the same for Go and Rust.
 
-Enums, domains and user-defined types fall through to `unknown`. Override
-anything with a `types` block:
-
-```json
-{
-  "queries": "queries",
-  "output": "src/generated/queries.ts",
-  "types": {
-    "order_status": "'pending' | 'shipped' | 'cancelled'",
-    "bigint": "bigint"
-  }
-}
-```
-
-## Nullability
-
-The generator uses `pg_describe`'s `result_not_null`, which accounts for outer
-joins rather than reading `attnotnull` alone. A column on the nullable side of a
-`LEFT JOIN` is typed `T | null` even when its source column is `NOT NULL` —
-which is the case most generators get wrong.
-
-Where nullability is unknown (an expression column, a set operation), the
-generator emits `T | null`. Over-declaring a null costs one impossible check;
-under-declaring one costs a crash.
-
-Parameters are declared non-null. Passing `null` is legal SQL, but it is almost
-always a bug rather than an intent, and `| null` on every parameter makes the
-generated types tiresome.
+pgTyped asks the server the same question over the wire protocol, from the
+client, and needs no extension — which is what you want on RDS, Cloud SQL and
+most managed Postgres, where `pg_describe` cannot be installed at all. This
+generator moves the question into the server: one `SELECT` per query, real SQL
+in the query files, and outer-join-aware nullability.
 
 ## License
 

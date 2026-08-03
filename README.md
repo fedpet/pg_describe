@@ -1,6 +1,12 @@
 # pg_describe
 
-Ask PostgreSQL what a query would return, without running it.
+[![CI](https://github.com/sajonaro/pg_describe/actions/workflows/ci.yml/badge.svg)](https://github.com/sajonaro/pg_describe/actions/workflows/ci.yml)
+[![PGXN](https://img.shields.io/badge/PGXN-pg__describe-blue)](https://pgxn.org/dist/pg_describe/)
+[![npm](https://img.shields.io/npm/v/pg-describe-gen)](https://www.npmjs.com/package/pg-describe-gen)
+[![PostgreSQL 17](https://img.shields.io/badge/PostgreSQL-17-336791)](https://www.postgresql.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+**pg_describe reports what a query would return, without running it.**
 
 ```sql
 SELECT * FROM pg_describe('SELECT id, email FROM users WHERE id = $1');
@@ -13,135 +19,57 @@ SELECT * FROM pg_describe('SELECT id, email FROM users WHERE id = $1');
  column |   2 | email | text      | users        | t             | t
 ```
 
-Nothing is executed — the extension runs PostgreSQL's parser and analyser and
-stops before the executor. Describing `DELETE FROM orders WHERE id = $1` is
-safe, and reports that `$1` is an `integer`. Parameter types are inferred; the
-query text never declares one.
+## Features
 
-Idea taken from [pgTyped](https://github.com/adelsz/pgtyped), which does this
-from the client by sending `Parse`/`Describe` over the wire protocol and never
-sending `Bind`. `pg_describe` asks the same question from inside the server.
+- **Nothing is executed** — parse and analysis only, so describing
+  `DELETE FROM orders WHERE id = $1` is safe.
+- **Parameter types are inferred**; the query text never declares one.
+- **Result columns as the wire protocol sees them** — name, type OID and SQL
+  type name, with `ORDER BY`-only columns excluded.
+- **Outer-join-aware nullability**: a column on the nullable side of a
+  `LEFT JOIN` is reported nullable even when it is declared `NOT NULL`. Tools
+  that read `attnotnull` alone get this wrong.
+- **Column provenance** — the source table and column behind each result field.
+- **One round trip.** It is an ordinary `SELECT`, callable from any client in
+  any language, with no wire-protocol code to write.
+- **Privileges are enforced**, so it cannot be used to read a schema the caller
+  has no rights to.
+- **TypeScript code generation** from plain `.sql` files, included.
 
-## Why
+## Documentation
 
-| | pgTyped / sqlc / sqlx | pg_describe |
-|---|---|---|
-| Implementation | Wire protocol code in the client, per language | One `SELECT` |
-| Round trips per query | Several | One |
-| Query files | Rewritten dialect (`:paramName`) | Real SQL (`$1`), runs in psql as-is |
-| `LEFT JOIN` nullability | Wrong — reads `attnotnull` alone | Correct |
-| Needs an extension installed | No | **Yes** |
+Full documentation: **https://sajonaro.github.io/pg_describe/**
 
-That last row is the real cost. On RDS, Cloud SQL and most managed Postgres you
-cannot install extensions, and pgTyped is the option that works.
-
-## Nullability
-
-`attnotnull` says whether a *source column* is `NOT NULL`. That is a different
-question from whether a *result column* can be NULL:
-
-```sql
-SELECT ord, name, source_table::text, base_not_null, result_not_null
-FROM pg_describe('SELECT o.id, c.email FROM orders o
-                  LEFT JOIN customers c ON c.id = o.customer_id');
-```
-```
- ord | name  | source_table | base_not_null | result_not_null
------+-------+--------------+---------------+-----------------
-   1 | id    | orders       | t             | t
-   2 | email | customers    | t             | f
-```
-
-`customers.email` is `NOT NULL`, and the result column is NULL anyway for an
-order with no customer. Tools reading `attnotnull` alone type that field
-non-nullable.
-
-`result_not_null` comes from walking the query's join tree, which also covers
-nesting:
-
-```
-a LEFT JOIN (b JOIN c)    ->  b and c both nullable
-(a LEFT JOIN b) JOIN c    ->  only b nullable
-```
-
-`GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` are handled the same way. Where the
-analysis is uncertain it reports nullable.
-
-Not modelled: set operations, subqueries and CTEs (no provenance, so no flags),
-and `CHECK` constraints or `WHERE x IS NOT NULL`. All fail safe.
-
-## Install
-
-### Docker
+## Getting started
 
 ```bash
 git clone https://github.com/sajonaro/pg_describe
 cd pg_describe
 docker compose up -d          # PGPORT=5433 docker compose up -d  if 5432 is taken
+
 psql -h localhost -U postgres -d pg_describe_demo \
      -c "SELECT * FROM pg_describe('SELECT 1 AS n')"
 ```
 
-The image builds the extension and creates it in the demo database and
-`template1`.
-
-### PGXN
+Or install it into a database you already have:
 
 ```bash
 pgxn install pg_describe
 ```
-
 ```sql
 CREATE EXTENSION pg_describe;
 ```
 
-Building needs the server headers (`postgresql-server-dev-17` on Debian,
-`postgresql17-devel` on RHEL) and a C compiler. The `Makefile` is standard PGXS.
+Needs PostgreSQL 17 (16 will probably work, untested) and the ability to install
+extensions — see [Installation](docs/installation.md). For TypeScript types:
 
-**PostgreSQL 17**, tested in CI on every commit. The code needs
-`Query->rteperminfos`, which is PG16+, so 16 will probably work — untested.
-
-## The function
-
-```sql
-pg_describe(sql text) RETURNS TABLE (
-  kind            text,      -- 'param' | 'column'
-  ord             int,       -- $1..$n, or column 1..n
-  name            text,      -- output column name; NULL for params
-  type_oid        oid,
-  type_name       text,      -- 'integer', 'character varying(10)'
-  source_table    regclass,  -- NULL unless the column is a plain column reference
-  source_column   text,
-  base_not_null   boolean,   -- attnotnull on the source column
-  result_not_null boolean    -- can this result column be NULL. Use this one.
-)
+```bash
+npm install --save-dev pg-describe-gen
 ```
 
-- `SELECT` describes its select list. `INSERT`/`UPDATE`/`DELETE` describe their
-  `RETURNING` list, or nothing without one. Utility statements describe no columns.
-- Expressions (`upper(x)`, `count(*)`, literals) have a type but no provenance:
-  `source_table`, `source_column` and both flags are NULL. NULL means unknown;
-  treat it as nullable.
-- One statement per call.
-- Analysis takes `AccessShareLock` on every referenced relation, held to end of
-  transaction.
+## Example
 
-### Permissions
-
-Parse analysis does not check privileges — it records them and leaves
-enforcement to the executor, which is never reached here. `pg_describe` performs
-the check itself before returning any row, mirroring `ExecCheckPermissions`:
-relation-level rights, then per-column rights, honouring `checkAsUser`, failing
-through `aclcheck_error`. `GRANT SELECT (email) ON users` lets a role describe
-`SELECT email FROM users` but not `SELECT note FROM users`.
-
-Without that check the function would expose every table's structure to any
-caller. It still parses arbitrary SQL, so grant `EXECUTE` deliberately.
-
-## TypeScript
-
-[`pg-describe-gen`](packages/codegen) generates types from plain `.sql` files.
-Query files stay valid SQL — native `$1`, no dialect.
+Write plain SQL. Native `$1`, no dialect, so the file runs in `psql` as it is:
 
 ```sql
 -- queries/orders.sql
@@ -157,15 +85,17 @@ WHERE o.placed_at >= $1;
 npx pg-describe-gen
 ```
 
+Get types the database itself vouches for:
+
 ```typescript
 export interface ListRecentOrdersParams {
   p1: Date
 }
 
 export interface ListRecentOrdersRow {
-  id: string            // orders.id       — bigint
-  total: string         // orders.total    — numeric
-  email: string | null  // customers.email — LEFT JOIN
+  id: string            // orders.id       — bigint arrives as a string
+  total: string         // orders.total    — numeric arrives as a string
+  email: string | null  // customers.email — NOT NULL, but LEFT JOINed
 }
 
 /**
@@ -177,43 +107,64 @@ export async function listRecentOrders(
 ): Promise<ListRecentOrdersRow[]>
 ```
 
-`bigint` and `numeric` map to `string` because that is what node-postgres
-returns. SQL comments become JSDoc.
+`email` is nullable because the join can null-extend it, not because the schema
+says so — that is the difference. Add `pg-describe-gen --check` to CI and a
+migration that changes what a query returns fails the pull request instead of
+the deploy.
 
-```bash
-pg-describe-gen --check    # exit 1 if the generated file is out of date
+The [end-to-end example](docs/end-to-end-example.md) walks the whole loop, and
+[`examples/typescript`](examples/typescript) is it, runnable.
+
+## Resources
+
+- [Getting started](docs/getting-started.md) — a database with the extension in one command
+- [End-to-end example](docs/end-to-end-example.md) — schema to failing build
+- [Queries in SQL files](docs/queries-in-sql-files.md) — how query files are written
+- [CLI usage and configuration](docs/cli-configuration.md) — `pg-describe-gen`
+- [Nullability](docs/nullability.md) — what `result_not_null` means and where it stops
+- [Function reference](docs/function-reference.md) — the full signature and semantics
+- [Permissions](docs/permissions.md) — why the function checks privileges itself
+- [How it works](docs/how-it-works.md) — the parser, the join tree walk, the internals
+
+## Repository
+
+```
+src/pg_describe.c        the extension
+test/                    pg_regress suite, 29 assertions
+packages/codegen/        pg-describe-gen, published to npm
+examples/typescript/     runnable example, generated output committed
+docs/                    documentation source
+website/                 Docusaurus site that renders docs/
 ```
 
-[`examples/typescript`](examples/typescript) is a complete runnable project.
+`packages/*` and `examples/*` are npm workspaces: `npm install` at the root
+wires the example to the local generator. See [Contributing](docs/contributing.md)
+for the test and docs workflows.
 
-## How it works
+## Project state
 
-```c
-raw   = pg_parse_query(sql);                       /* text -> RawStmt */
-query = parse_analyze_varparams(rawstmt, sql,      /* RawStmt -> Query */
-                                &types, &n, NULL);
-/* stop: rewrite, plan and execute are never called */
-```
+The extension and the generator are complete and tested on every commit, but
+this is young. The API of `pg_describe(text)` is what the TypeScript generator
+depends on and is not expected to change; the generator's config file may
+still gain keys. Issues and pull requests are welcome.
 
-`parse_analyze_varparams` is what `exec_parse_message` calls to serve a `Parse`
-message with no declared parameter types.
+## Credit
 
-[`docs/how-it-works.md`](docs/how-it-works.md) covers the `Query` tree, the join
-tree walk, the permission check and error-position handling.
+The idea is taken from [pgTyped](https://github.com/adelsz/pgtyped) by
+[Adel Salakh](https://github.com/adelsz), which demonstrated that TypeScript
+types for SQL can come from a live database rather than a hand-maintained model
+of it. [`sqlc`](https://sqlc.dev) and [`sqlx`](https://github.com/launchbadge/sqlx)
+do the same for Go and Rust.
 
-## Development
-
-```bash
-docker compose up -d --build
-docker compose cp ./test db:/src/pg_describe/
-docker compose exec db bash -lc \
-  'cd /src/pg_describe && PGUSER=postgres PGHOST=/var/run/postgresql \
-   PGDATABASE=contrib_regression make installcheck'
-```
-
-29 assertions: parameter inference, provenance, join shapes and nesting,
-grouping sets, statement shapes, errors, permissions.
+pgTyped asks the server the same question over the wire protocol, from the
+client, and needs no extension — which is what you want on RDS, Cloud SQL and
+most managed Postgres, where `pg_describe` cannot be installed at all. It is
+mature, actively maintained and has a larger feature surface than this project.
+`pg_describe` moves the question into the server for the cases where you can
+install an extension: one `SELECT` instead of a wire-protocol implementation per
+language, and nullability that accounts for outer joins. See
+[Credit](docs/credit.md).
 
 ## License
 
-MIT.
+MIT © 2026-present, see [LICENSE](LICENSE).

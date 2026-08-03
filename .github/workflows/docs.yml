@@ -1,0 +1,64 @@
+# Publishes the Docusaurus site in website/ to GitHub Pages.
+#
+# Requires Pages to be enabled for the repository with "GitHub Actions" as the
+# source (Settings -> Pages -> Build and deployment). Until it is, this workflow
+# fails at the deploy step while CI still proves the site builds.
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'website/**'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+# Pages needs these; the default GITHUB_TOKEN permissions are not enough.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, and let a newer commit win rather than queueing behind
+# an in-flight run.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # showLastUpdateTime reads git history, which a shallow clone lacks.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: build
+        working-directory: website
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/build
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

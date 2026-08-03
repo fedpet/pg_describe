@@ -1,0 +1,27 @@
+{
+  "name": "pg-describe-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Workspace root for the pg_describe TypeScript tooling. The extension itself is C and is packaged for PGXN, not npm.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sajonaro/pg_describe.git"
+  },
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "npm run build --workspace pg-describe-gen",
+    "generate": "npm run generate --workspace pg-describe-example",
+    "check": "npm run check --workspace pg-describe-example",
+    "typecheck": "npm run typecheck --workspace pg-describe-example",
+    "demo": "npm run demo --workspace pg-describe-example",
+    "docs": "npm --prefix website run start",
+    "docs:build": "npm --prefix website run build"
+  }
+}

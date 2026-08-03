@@ -1,0 +1,40 @@
+/* PostgreSQL blue, kept close to the elephant. */
+:root {
+  --ifm-color-primary: #31648c;
+  --ifm-color-primary-dark: #2c5a7e;
+  --ifm-color-primary-darker: #295577;
+  --ifm-color-primary-darkest: #224662;
+  --ifm-color-primary-light: #366e9a;
+  --ifm-color-primary-lighter: #3973a1;
+  --ifm-color-primary-lightest: #4082b6;
+  --ifm-code-font-size: 92%;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.08);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #8ab4d8;
+  --ifm-color-primary-dark: #71a3ce;
+  --ifm-color-primary-darker: #649bca;
+  --ifm-color-primary-darkest: #4180b4;
+  --ifm-color-primary-light: #a3c5e2;
+  --ifm-color-primary-lighter: #b0cde6;
+  --ifm-color-primary-lightest: #d6e5f2;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}
+
+/* Much of this documentation is psql output in fenced blocks, which is only
+   legible if the columns line up and the block does not wrap. */
+.markdown pre code {
+  font-variant-ligatures: none;
+  tab-size: 4;
+}
+
+/* The comparison tables read better without full-width stretched cells. */
+.markdown table {
+  display: table;
+  width: 100%;
+}
+
+.markdown table td:first-child {
+  white-space: nowrap;
+}

@@ -1,3 +1,9 @@
+---
+id: how-it-works
+title: How it works
+sidebar_label: How it works
+---
+
 # How pg_describe works
 
 ## Stopping the pipeline

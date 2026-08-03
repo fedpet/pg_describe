@@ -1,7 +1,8 @@
 # TypeScript example
 
 Schema, queries, committed generated output, and a demo that connects to a real
-database.
+database. The narrated version of this is the
+[end-to-end example](../../docs/end-to-end-example.md) in the documentation.
 
 ## Run
 
@@ -10,18 +11,18 @@ From the repository root:
 ```bash
 docker compose up -d --build          # PGPORT=5433 ... if 5432 is taken
 
-cd packages/codegen && npm install && npm run build && cd -
-cd examples/typescript && npm install
+npm install                           # workspace root: wires this example to packages/codegen
+npm run build
+
+docker compose exec -T db psql -U postgres -d pg_describe_demo -q \
+  < examples/typescript/schema.sql
 
 export PGHOST=localhost PGPORT=5432 PGUSER=postgres \
        PGPASSWORD=postgres PGDATABASE=pg_describe_demo
 
-docker compose -f ../../docker-compose.yml exec -T db \
-  psql -U postgres -d pg_describe_demo -q < schema.sql
-
-npx pg-describe-gen
-npx tsc --noEmit
-node src/demo.ts
+npm run generate
+npm run typecheck
+npm run demo
 ```
 
 ```
@@ -36,6 +37,9 @@ lookup
 daily totals
   2026-08-03  n=3  154.45
 ```
+
+Those scripts are workspace-aware, so `npm run demo` from the root and
+`npm run demo` from this directory do the same thing.
 
 ## Files
 
@@ -57,7 +61,7 @@ read without running anything:
 const who: string = order.email ?? '(guest)'
 ```
 
-Remove the `?? '(guest)'` and `npx tsc --noEmit` fails:
+Remove the `?? '(guest)'` and `npm run typecheck` fails:
 
 ```
 error TS2322: Type 'string | null' is not assignable to type 'string'.
@@ -66,7 +70,7 @@ error TS2322: Type 'string | null' is not assignable to type 'string'.
 ## CI gate
 
 ```bash
-npx pg-describe-gen --check
+npm run check
 ```
 
 Exit 0 when the committed file matches the database, 1 when it does not:
@@ -75,6 +79,6 @@ Exit 0 when the committed file matches the database, 1 when it does not:
 docker compose -f ../../docker-compose.yml exec -T db \
   psql -U postgres -d pg_describe_demo -c 'ALTER TABLE customers ALTER COLUMN vip DROP NOT NULL;'
 
-npx pg-describe-gen --check
+npm run check
 # src/generated/queries.ts is out of date. Run pg-describe-gen to regenerate it.
 ```

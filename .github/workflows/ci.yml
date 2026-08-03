@@ -43,42 +43,57 @@ jobs:
       - name: start server
         run: docker compose up -d --build --wait db
 
-      - name: build the generator
-        working-directory: packages/codegen
+      # One install for the whole workspace: packages/* and examples/*. The
+      # example resolves pg-describe-gen to the local package by symlink, so
+      # what is tested here is the code in this commit.
+      - name: install the workspace and build the generator
         run: |
-          npm install
+          npm ci
           npm run build
 
       - name: load the example schema
         run: docker compose exec -T db psql -U postgres -d pg_describe_demo -q < examples/typescript/schema.sql
 
-      - name: install the example
-        working-directory: examples/typescript
-        run: npm install
-
       # The real assertion: regenerating against a live database must reproduce
       # the file in the repository byte for byte. If the extension's output
       # changes, or the emitter changes, or the schema drifts, this fails.
       - name: generated output is up to date
-        working-directory: examples/typescript
         env:
           PGHOST: localhost
           PGPORT: 5432
           PGUSER: postgres
           PGPASSWORD: postgres
           PGDATABASE: pg_describe_demo
-        run: npx pg-describe-gen --check
+        run: npm run check
 
       - name: example typechecks
-        working-directory: examples/typescript
-        run: npx tsc --noEmit
+        run: npm run typecheck
 
       - name: example runs
-        working-directory: examples/typescript
         env:
           PGHOST: localhost
           PGPORT: 5432
           PGUSER: postgres
           PGPASSWORD: postgres
           PGDATABASE: pg_describe_demo
-        run: node src/demo.ts
+        run: npm run demo
+
+  docs:
+    name: documentation site builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      # onBrokenLinks: throw, so a link to a page that was renamed or never
+      # written fails here rather than shipping a 404.
+      - name: build the site
+        working-directory: website
+        run: |
+          npm ci
+          npm run build
