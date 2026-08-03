@@ -4,13 +4,23 @@
   "description": "Generate TypeScript types from plain .sql files, using the pg_describe PostgreSQL extension",
   "keywords": ["postgres", "postgresql", "typescript", "codegen", "sql", "types"],
   "license": "MIT",
+  "author": "sajonaro",
+  "homepage": "https://sajonaro.github.io/pg_describe/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sajonaro/pg_describe.git",
+    "directory": "packages/codegen"
+  },
+  "bugs": {
+    "url": "https://github.com/sajonaro/pg_describe/issues"
+  },
   "type": "module",
   "bin": {
     "pg-describe-gen": "dist/cli.js"
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist", "README.md"],
+  "files": ["dist", "README.md", "LICENSE"],
   "engines": {
     "node": ">=18"
   },
