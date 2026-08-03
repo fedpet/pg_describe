@@ -1,22 +1,12 @@
 /**
  * PostgreSQL type name -> TypeScript type.
  *
- * The type names here are what `format_type_be` prints, which is the SQL
- * spelling ("integer", "character varying(10)", "timestamp with time zone"),
- * not the catalog spelling ("int4", "varchar", "timestamptz").
+ * Names are what `format_type_be` prints: the SQL spelling ("integer",
+ * "character varying(10)"), not the catalog spelling ("int4", "varchar").
  *
- * Two mappings routinely surprise people, and both are correct:
- *
- *   bigint  -> string    An int8 does not fit in a JavaScript number. Rather
- *                        than silently lose precision above 2^53, node-postgres
- *                        returns it as a string, so that is what we declare.
- *
- *   numeric -> string    Same reasoning, more urgently: numeric is arbitrary
- *                        precision and exists precisely because floats are
- *                        wrong for money. node-postgres returns it as a string.
- *
- * If you have configured node-postgres type parsers to override either of
- * those, use the `types` block in your config to say so.
+ * bigint and numeric map to `string` because that is what node-postgres
+ * returns — neither survives a JavaScript number. Override via the `types`
+ * block in the config if you have installed custom type parsers.
  */
 
 /** Exact matches, checked first. */
@@ -26,8 +16,7 @@ const EXACT: Record<string, string> = {
   real: 'number',
   'double precision': 'number',
 
-  // See the note above: not `number`, on purpose.
-  bigint: 'string',
+  bigint: 'string', // not number: see the header note
 
   boolean: 'boolean',
 
@@ -61,7 +50,7 @@ const EXACT: Record<string, string> = {
 const PREFIX: Array<[string, string]> = [
   ['character varying', 'string'],
   ['character', 'string'],
-  ['numeric', 'string'], // see the note above
+  ['numeric', 'string'],
   ['decimal', 'string'],
   ['timestamp', 'Date'],
   ['time', 'string'], // time / time with time zone have no Date equivalent
@@ -106,8 +95,7 @@ export function tsTypeFor(
     if (name.startsWith(prefix)) return { ts, unmapped: false }
   }
 
-  // Enums, domains and user-defined types land here. `unknown` is deliberate:
-  // it compiles, and it forces the consumer to narrow rather than quietly
-  // trusting a wrong guess.
+  // Enums, domains and user-defined types. `unknown` forces the consumer to
+  // narrow rather than trust a wrong guess.
   return { ts: 'unknown', unmapped: true }
 }

@@ -37,17 +37,10 @@ async function sqlFiles(dir: string): Promise<string[]> {
 /**
  * Split one file into its annotated queries.
  *
- * The format is deliberately minimal, and deliberately still valid SQL:
- *
  *     -- @name ListVipOrders
- *     SELECT o.id, c.email
- *     FROM orders o LEFT JOIN customers c ON c.id = o.customer_id
- *     WHERE o.placed_at >= $1;
+ *     SELECT o.id FROM orders o WHERE o.placed_at >= $1;
  *
- * Placeholders are native `$1`, not a bespoke `:name` syntax, so the file you
- * generate types from is a file you can paste straight into psql. That is the
- * main ergonomic difference from pgTyped, and it falls out of pg_describe
- * taking real SQL rather than a rewritten dialect.
+ * Placeholders are native `$1`, so the file stays runnable in psql.
  */
 export function parseQueries(text: string, file: string): SqlQuery[] {
   const lines = text.split('\n')
@@ -58,10 +51,9 @@ export function parseQueries(text: string, file: string): SqlQuery[] {
   const flush = () => {
     if (!current) return
 
-    // Split the leading comment block off the statement. Everything from the
-    // annotation down to the first line of real SQL is documentation; keeping
-    // it out of the statement means the emitted `...Sql` constant is the query
-    // and nothing else, while the prose still reaches the caller as JSDoc.
+    // Everything from the annotation down to the first line of real SQL is
+    // documentation. Keeping it out of the statement leaves the emitted
+    // `...Sql` constant as the query alone.
     const body = [...current.body]
     const doc: string[] = []
 

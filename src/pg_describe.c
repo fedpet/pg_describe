@@ -1,39 +1,23 @@
 /*
- * pg_describe -- report what a query WOULD return, without running it.
+ * pg_describe -- report what a query would return, without running it.
  *
- * The mechanism is the front half of the server's own query pipeline:
+ *     pg_parse_query()           text    -> RawStmt   (grammar only)
+ *     parse_analyze_varparams()  RawStmt -> Query     (names, types, params)
+ *     rewrite / plan / execute                        (never called)
  *
- *     pg_parse_query()           raw text -> RawStmt      (grammar only)
- *     parse_analyze_varparams()  RawStmt  -> Query        (names, types, params)
- *     ------------------------ we stop here ------------------------
- *     pg_rewrite_query() / pg_plan_query() / ExecutorRun()  (never reached)
+ * parse_analyze_varparams() is what exec_parse_message() calls to serve a Parse
+ * message with no declared parameter types, so $1 comes back typed rather than
+ * rejected: the analyser infers it from the context the parameter appears in.
  *
- * parse_analyze_varparams() is the function the wire protocol's Parse message
- * uses when the client declares no parameter types, which is why $1 comes back
- * with a real type instead of an error: the analyser infers it from the context
- * the parameter is used in.
+ * Three functions here are load-bearing:
  *
- * Clients have been able to ask this question for twenty years, by sending
- * Parse + Describe and never sending Bind or Execute. Doing it from inside the
- * server instead means one ordinary SELECT answers it, for any driver in any
- * language, with no wire-protocol code anywhere.
- *
- * Three parts of this file are load-bearing and easy to get wrong:
- *
- *   check_permissions()  Parse analysis does NOT check privileges -- it records
- *                        them and leaves enforcement to the executor, which we
- *                        never reach. Without this, pg_describe would hand the
- *                        schema of every table to anyone who can call it.
- *
- *   find_nullable()      attnotnull describes the SOURCE column. Under an outer
- *                        join the RESULT column can be NULL anyway. This is the
- *                        walk that tells the two apart, and it is the reason
- *                        this extension generates correct types where tools
- *                        reading attnotnull alone do not.
- *
- *   describe_error_cb()  parse errors carry a cursor position measured against
- *                        the inner query; without relocating it the caret is
- *                        drawn against the outer call, pointing at nothing.
+ *   check_permissions()  Parse analysis does not check privileges; it records
+ *                        them for the executor, which is never reached. Without
+ *                        this the function exposes every table's structure.
+ *   find_nullable()      attnotnull describes the source column, not the result
+ *                        column. Outer joins separate the two.
+ *   describe_error_cb()  relocates a parse error's cursor position onto the
+ *                        inner query.
  */
 #include "postgres.h"
 #include "fmgr.h"
@@ -71,10 +55,9 @@ PG_MODULE_MAGIC;
 #define PD_NCOLS                9
 
 /*
- * Nullability flags are tri-state: true, false, or unknown. Unknown is a real
- * and distinct answer -- an expression column has no attnotnull to report, and
- * saying "false" there would be a claim we have not earned. Consumers should
- * treat unknown as nullable; the reference code generator does.
+ * Nullability flags are tri-state: true, false, unknown. An expression column
+ * has no attnotnull to report, so unknown is a distinct answer from false.
+ * Consumers treat unknown as nullable.
  */
 #define PD_UNKNOWN            (-1)
 
@@ -156,16 +139,12 @@ emit_row(ReturnSetInfo *rsinfo,
 
 /* ------------------------------------------------------------------------
  * Outer-join nullability
- *
- * This is what pg_describe has that tools reading attnotnull alone do not.
  * --------------------------------------------------------------------- */
 
 /*
- * Every base-relation range table index at or below a jointree node.
- *
- * A JoinExpr also has an rtindex of its own -- the RTE for the join's alias --
- * but that is not a base relation and no target-list Var we report provenance
- * for refers to it, so it is deliberately not collected.
+ * Every base-relation range table index at or below a jointree node. A
+ * JoinExpr's own rtindex (the RTE for its alias) is not a base relation and no
+ * Var we report provenance for refers to it, so it is skipped.
  */
 static void
 collect_rtindexes(Node *jtnode, Bitmapset **result)
@@ -194,23 +173,15 @@ collect_rtindexes(Node *jtnode, Bitmapset **result)
 }
 
 /*
- * Range table indexes whose columns can be NULL in the result because they sit
- * on the nullable side of an outer join.
+ * Range table indexes that sit on the nullable side of an outer join.
  *
- * The recursion is what makes nesting work, and nesting is where naive
- * implementations break. Two cases to hold in mind:
+ *   a LEFT JOIN (b JOIN c)   b and c both. No match null-extends the whole
+ *                            right subtree, so the inner join is irrelevant.
+ *   (a LEFT JOIN b) JOIN c   b only.
  *
- *   a LEFT JOIN (b JOIN c)   -- b AND c are both nullable. The inner join
- *                               between them is irrelevant: if the outer join
- *                               finds no match, the whole right subtree is
- *                               null-extended at once.
- *
- *   (a LEFT JOIN b) JOIN c   -- only b is nullable. c is joined afterwards and
- *                               inner-joined at that.
- *
- * Recursing into both arms BEFORE applying this node's own rule is what gets
- * the first case right: collect_rtindexes() sweeps the entire nullable subtree,
- * however deep, while the recursive calls catch outer joins nested inside it.
+ * Recursing into both arms before applying this node's rule is what gets the
+ * first case right: collect_rtindexes() sweeps the entire nullable subtree
+ * while the recursive calls catch outer joins nested inside it.
  */
 static void
 find_nullable(Node *jtnode, Bitmapset **nullable)
@@ -245,17 +216,10 @@ find_nullable(Node *jtnode, Bitmapset **nullable)
  * --------------------------------------------------------------------- */
 
 /*
- * Without this, an error in the described query reports a cursor position
- * measured against the inner text but drawn against the OUTER statement:
- *
- *     ERROR:  syntax error at or near "WHERE"
- *     LINE 1: SELECT * FROM pg_describe('SELECT FROM WHERE');
- *                         ^
- *
- * The caret lands on whatever happens to sit at that offset of the call. SPI
- * has the same problem and solves it the same way: clear the ordinary position
- * and re-report it as an INTERNAL position against the inner query, which
- * clients render as a separate QUERY: line.
+ * A parse error's position is measured against the inner query but drawn
+ * against the outer statement, so the caret lands on nothing. Clear the
+ * ordinary position and re-report it as internal, against the inner query;
+ * clients render that as a separate QUERY: line. Same approach as SPI.
  */
 static void
 describe_error_cb(void *arg)
@@ -276,20 +240,13 @@ describe_error_cb(void *arg)
  * --------------------------------------------------------------------- */
 
 /*
- * Do the check the executor would have done.
+ * The check ExecutorStart would have done via ExecCheckPermissions. Parse
+ * analysis only records the requirement in Query->rteperminfos; without this,
+ * any caller could read every table's structure.
  *
- * Parse analysis resolves names and types but does not check whether the
- * calling role may read what it resolved -- it only records the requirement, in
- * Query->rteperminfos. ExecutorStart enforces it via ExecCheckPermissions, and
- * we never get there.
- *
- * Skipping this would not leak data, it would leak the SCHEMA: the column
- * names, types and structure of every table in the database, to any role that
- * can call the function. That is usually the first thing an attacker wants.
- *
- * The order below mirrors ExecCheckOneRelPerms: relation-level rights first,
- * then per-column rights where those are missing, because GRANT SELECT (col) is
- * a real and common way to hold partial access.
+ * Order mirrors ExecCheckOneRelPerms: relation-level rights first, then
+ * per-column rights where those are missing, since GRANT SELECT (col) is a
+ * common way to hold partial access.
  */
 static void
 check_permissions(Query *query)
@@ -331,11 +288,10 @@ check_permissions(Query *query)
             int  col = -1;
 
             /*
-             * selectedCols members are attribute numbers OFFSET by
-             * FirstLowInvalidHeapAttributeNumber (-7), so that system columns,
-             * whose attnums are negative, fit in a Bitmapset. Forgetting the
-             * offset checks the wrong column -- silently, and in the permissive
-             * direction.
+             * selectedCols members are offset by
+             * FirstLowInvalidHeapAttributeNumber (-7) so that system columns,
+             * whose attnums are negative, fit in a Bitmapset. Missing the
+             * offset checks the wrong column, permissively.
              */
             while ((col = bms_next_member(perminfo->selectedCols, col)) >= 0)
             {
@@ -360,10 +316,8 @@ check_permissions(Query *query)
         }
 
         /*
-         * aclcheck_error, not a hand-rolled ereport: the message, the SQLSTATE
-         * and the object naming then match what the query itself would have
-         * produced. A caller should not be able to tell this check apart from
-         * the executor's.
+         * aclcheck_error rather than a hand-rolled ereport, so message,
+         * SQLSTATE and object naming match what the query itself would raise.
          */
         aclcheck_error(ACLCHECK_NO_PRIV,
                        get_relkind_objtype(get_rel_relkind(relid)),
@@ -391,15 +345,8 @@ describe_columns(ReturnSetInfo *rsinfo, Query *query, List *tlist)
 
     /*
      * GROUP BY ROLLUP / CUBE / GROUPING SETS emits super-aggregate rows in
-     * which the grouping columns are NULL, no matter how NOT NULL the
-     * underlying column is. It is the same class of false positive as the outer
-     * join, from a different direction, and tools that read attnotnull alone
-     * miss it too.
-     *
-     * The treatment here is deliberately blunt -- if the query has grouping
-     * sets, no provenance-bearing column is reported as guaranteed non-null.
-     * Being too cautious costs a consumer one impossible null check; being too
-     * confident costs them a production crash.
+     * which grouping columns are NULL regardless of attnotnull. Treated
+     * bluntly: with grouping sets, nothing is reported guaranteed non-null.
      */
     grouping_sets = (query->groupingSets != NIL);
 
@@ -412,9 +359,8 @@ describe_columns(ReturnSetInfo *rsinfo, Query *query, List *tlist)
         int          result_not_null = PD_UNKNOWN;
 
         /*
-         * resjunk entries are in the list but not in the result: the sort key
-         * ORDER BY adds for a column you did not select, the ctid a FOR UPDATE
-         * needs. RowDescription does not report them and neither do we.
+         * resjunk entries are in the list but not the result: an ORDER BY sort
+         * key for an unselected column, the ctid FOR UPDATE needs.
          */
         if (tle->resjunk)
             continue;
@@ -422,21 +368,18 @@ describe_columns(ReturnSetInfo *rsinfo, Query *query, List *tlist)
         ord++;
 
         /*
-         * Provenance is meaningful only when the output column IS a column: a
-         * bare Var into a real relation. upper(email), count(*) and literals
-         * have a type but no source, and RowDescription agrees -- it reports
-         * tableOID 0 for exactly these.
+         * Provenance applies only to a bare Var into a real relation.
+         * upper(email), count(*) and literals have a type but no source;
+         * RowDescription reports tableOID 0 for these too.
          */
         if (IsA(tle->expr, Var))
         {
             Var *var = (Var *) tle->expr;
 
             /*
-             * varlevelsup > 0 refers to an ENCLOSING query's range table, so
-             * rt_fetch against this one would silently read the wrong entry and
-             * report provenance pointing at the wrong table. varattno <= 0 is a
-             * whole-row reference or a system column, neither of which has the
-             * pg_attribute row we are about to read.
+             * varlevelsup > 0 refers to an enclosing query's range table, so
+             * rt_fetch here would read the wrong entry. varattno <= 0 is a
+             * whole-row reference or system column, with no pg_attribute row.
              */
             if (var->varlevelsup == 0 && var->varattno > 0)
             {
@@ -449,10 +392,8 @@ describe_columns(ReturnSetInfo *rsinfo, Query *query, List *tlist)
                                                      Int16GetDatum(var->varattno));
 
                     /*
-                     * The syscache, not a query against pg_attribute. A client
-                     * doing this from outside pays a round trip; in here it is
-                     * a hash lookup in memory the backend already holds, over a
-                     * relation the analysis above has already locked.
+                     * Syscache rather than a query against pg_attribute: a hash
+                     * lookup over a relation analysis has already locked.
                      */
                     if (HeapTupleIsValid(atup))
                     {
@@ -463,9 +404,8 @@ describe_columns(ReturnSetInfo *rsinfo, Query *query, List *tlist)
                         base_not_null = att->attnotnull ? 1 : 0;
 
                         /*
-                         * The distinction this extension exists for. A column
-                         * is non-null in the RESULT only if it is non-null at
-                         * the source AND nothing downstream can null-extend it.
+                         * Non-null in the result only if non-null at the source
+                         * and nothing downstream can null-extend it.
                          */
                         if (base_not_null == 0)
                             result_not_null = 0;
@@ -505,11 +445,7 @@ pg_describe(PG_FUNCTION_ARGS)
     int                  num_params = 0;
     int                  i;
 
-    /*
-     * Materialize mode: a describe result is a handful of rows, so building the
-     * whole set costs nothing and the code is far clearer than the
-     * value-per-call protocol would be.
-     */
+    /* Materialize mode: a describe result is a handful of rows. */
     InitMaterializedSRF(fcinfo, 0);
 
     /* Report parse errors against the inner query, not against the call. */
@@ -519,17 +455,12 @@ pg_describe(PG_FUNCTION_ARGS)
     error_context_stack = &errcallback;
 
     /*
-     * Stage one: grammar. Pure function of the text -- no catalog access, no
-     * name resolution. It will happily parse a SELECT against a table that does
-     * not exist. Errors here are syntax errors and nothing else.
+     * Grammar only: no catalog access, no name resolution. Parses a SELECT
+     * against a nonexistent table without complaint.
      */
     raw = pg_parse_query(sql);
 
-    /*
-     * A Parse message carries exactly one statement, and so do we. Accepting
-     * several would mean picking one to describe, and there is no defensible
-     * pick.
-     */
+    /* A Parse message carries exactly one statement, and so do we. */
     if (list_length(raw) != 1)
         ereport(ERROR,
                 (errcode(ERRCODE_SYNTAX_ERROR),
@@ -539,45 +470,34 @@ pg_describe(PG_FUNCTION_ARGS)
     rawstmt = linitial_node(RawStmt, raw);
 
     /*
-     * Stage two, and the point of the extension.
+     * varparams, not fixedparams: we pass an empty parameter array and it grows
+     * one, inferring each $n from context. `WHERE id = $1` against an integer
+     * column makes $1 an integer.
      *
-     * "varparams" is the difference from the fixedparams sibling: we hand it an
-     * empty parameter array and it grows one, inferring each $n's type from the
-     * context the parameter appears in. `WHERE id = $1` against an integer
-     * column makes $1 an integer. That is precisely what a client reads out of
-     * a ParameterDescription message.
-     *
-     * Note the invisible side effect: this resolves every name against the
-     * catalog and opens every referenced relation with AccessShareLock, held
-     * until the transaction ends. Describing is cheap, but neither free nor
-     * side-effect-free.
+     * Side effect worth knowing: this opens every referenced relation with
+     * AccessShareLock, held until the transaction ends.
      */
     query = parse_analyze_varparams(rawstmt, sql, &param_types, &num_params, NULL);
 
     /*
-     * Past the last thing that can raise a positioned parse error. On the error
-     * path this pop never runs and does not need to -- ereport unwinds the
-     * callback stack along with everything else.
+     * Past the last positioned parse error. On the error path this pop never
+     * runs and need not: ereport unwinds the callback stack.
      */
     error_context_stack = errcallback.previous;
 
-    /* Earn the right to talk about those relations before talking about them. */
+    /* Check privileges before reporting anything about those relations. */
     check_permissions(query);
 
-    /* Parameters, in $1..$n order: a ParameterDescription, assembled locally. */
+    /* Parameters, in $1..$n order. */
     for (i = 0; i < num_params; i++)
         emit_row(rsinfo, "param", i + 1, NULL, param_types[i],
                  InvalidOid, NULL, PD_UNKNOWN, PD_UNKNOWN);
 
     /*
-     * Where the result columns live depends on the statement:
-     *
-     *   SELECT                    -> targetList
-     *   INSERT/UPDATE/DELETE      -> returningList, empty without RETURNING
-     *   utility (CREATE TABLE...) -> neither. Utility statements are parked
-     *                                un-analysed in utilityStmt; they have no
-     *                                result columns, and reporting none is a
-     *                                better answer than an error.
+     *   SELECT               -> targetList
+     *   INSERT/UPDATE/DELETE -> returningList, empty without RETURNING
+     *   utility              -> neither; parked un-analysed in utilityStmt, so
+     *                           no result columns rather than an error.
      */
     if (query->commandType == CMD_SELECT)
         describe_columns(rsinfo, query, query->targetList);

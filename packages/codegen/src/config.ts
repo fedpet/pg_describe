@@ -20,12 +20,9 @@ export interface ResolvedConfig extends Config {
 const DEFAULT_FILE = 'pg-describe.json'
 
 /**
- * Connection settings are deliberately NOT part of this file.
- *
- * node-postgres reads DATABASE_URL and the standard PGHOST / PGPORT / PGUSER /
- * PGPASSWORD / PGDATABASE variables on its own, which keeps credentials out of
- * a file that wants to be committed. There is nothing to configure here: set
- * the environment and it connects.
+ * Connection settings are not part of this file: node-postgres reads
+ * DATABASE_URL and the standard PG* variables, keeping credentials out of a
+ * committed file.
  */
 export async function loadConfig(explicitPath?: string): Promise<ResolvedConfig> {
   const path = resolve(explicitPath ?? DEFAULT_FILE)

@@ -1,9 +1,9 @@
 # TypeScript example
 
-A complete, runnable project: schema, queries, committed generated output, and a
-demo that connects to a real database and prints real rows.
+Schema, queries, committed generated output, and a demo that connects to a real
+database.
 
-## Run it
+## Run
 
 From the repository root:
 
@@ -19,9 +19,9 @@ export PGHOST=localhost PGPORT=5432 PGUSER=postgres \
 docker compose -f ../../docker-compose.yml exec -T db \
   psql -U postgres -d pg_describe_demo -q < schema.sql
 
-npx pg-describe-gen        # regenerates src/generated/queries.ts
-npx tsc --noEmit           # typechecks
-node src/demo.ts           # runs
+npx pg-describe-gen
+npx tsc --noEmit
+node src/demo.ts
 ```
 
 ```
@@ -37,47 +37,39 @@ daily totals
   2026-08-03  n=3  154.45
 ```
 
-## What to look at
+## Files
 
-**[`queries/orders.sql`](queries/orders.sql)** — five queries, all valid SQL.
-Copy any of them into `psql`, supply the parameters, and they run. There is no
-dialect and no rewriting step between what you test and what you ship.
+[`queries/orders.sql`](queries/orders.sql) — five queries, all valid SQL. Paste
+any of them into psql with parameters and they run.
 
-**[`src/generated/queries.ts`](src/generated/queries.ts)** — committed on
-purpose, so you can read the output without running anything. Three things in it
-are worth noticing:
+[`src/generated/queries.ts`](src/generated/queries.ts) — committed so it can be
+read without running anything:
 
-- `email: string | null` in `ListRecentOrdersRow`. `customers.email` is declared
-  `NOT NULL`, but the query `LEFT JOIN`s it, so a guest order produces NULL. A
-  generator reading `attnotnull` alone types this `string` and is wrong.
-- `id: string` and `total: string`. `bigint` and `numeric` are returned as
-  strings by node-postgres, because neither survives a JavaScript number.
-- `DeleteOrdersBefore` returns `Promise<number>`, not a row array, because it has
-  no `RETURNING`.
+- `email: string | null` in `ListRecentOrdersRow`. `customers.email` is
+  `NOT NULL`, but the query `LEFT JOIN`s it, so a guest order yields NULL.
+- `id: string`, `total: string` — `bigint` and `numeric` come back as strings
+  from node-postgres.
+- `DeleteOrdersBefore` returns `Promise<number>`, having no `RETURNING`.
 
-**[`src/demo.ts`](src/demo.ts)** — line 39 is the point of the whole exercise:
+[`src/demo.ts`](src/demo.ts) line 39:
 
 ```typescript
 const who: string = order.email ?? '(guest)'
 ```
 
-Delete the `?? '(guest)'` and `npx tsc --noEmit` fails with
+Remove the `?? '(guest)'` and `npx tsc --noEmit` fails:
 
 ```
 error TS2322: Type 'string | null' is not assignable to type 'string'.
 ```
 
-That is a production null-dereference caught at compile time, from a NULL the
-schema alone does not predict.
-
-## The CI gate
+## CI gate
 
 ```bash
 npx pg-describe-gen --check
 ```
 
-Exits 0 when the committed file matches the database, 1 when it does not. Try
-it:
+Exit 0 when the committed file matches the database, 1 when it does not:
 
 ```bash
 docker compose -f ../../docker-compose.yml exec -T db \
@@ -85,8 +77,4 @@ docker compose -f ../../docker-compose.yml exec -T db \
 
 npx pg-describe-gen --check
 # src/generated/queries.ts is out of date. Run pg-describe-gen to regenerate it.
-# exit 1
 ```
-
-Put that in CI and a schema change that breaks a query fails the build rather
-than the deploy.

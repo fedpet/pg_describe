@@ -38,15 +38,8 @@ function templateLiteral(sql: string): string {
 }
 
 /**
- * Nullability of a result column.
- *
- * `result_not_null` is pg_describe's outer-join-aware answer. It is:
- *   true   guaranteed non-null
- *   false  can be null
- *   null   unknown — an expression, with no source column to reason from
- *
- * Unknown is treated as nullable. Over-declaring a null costs the consumer one
- * impossible check; under-declaring it costs them a crash in production.
+ * `result_not_null` is true (non-null), false (nullable) or null (unknown — an
+ * expression with no source column). Unknown is treated as nullable.
  */
 function isNullable(col: DescribeRow): boolean {
   return col.resultNotNull !== true
@@ -65,8 +58,7 @@ function emitRowInterface(
     const key = propertyKey(col.name ?? `column${i + 1}`)
     const type = isNullable(col) ? `${mapped.ts} | null` : mapped.ts
 
-    // Provenance, where there is any, makes the generated file reviewable:
-    // you can see at a glance which table a field came from.
+    // Provenance, where there is any, so the generated file is reviewable.
     const from =
       col.sourceTable && col.sourceColumn
         ? `  // ${col.sourceTable}.${col.sourceColumn}`
@@ -87,9 +79,8 @@ function emitParamsInterface(
   const fields = params.map((p) => {
     const mapped = tsTypeFor(p.typeName, opts.types)
     if (mapped.unmapped) unmapped.add(p.typeName)
-    // Parameters are declared non-null. Passing null is legal SQL, but it is
-    // almost always a bug rather than an intent, and `p1: T | null` on every
-    // parameter makes the generated types tiresome to use.
+    // Parameters are declared non-null: passing null is legal SQL but almost
+    // always a bug, and `| null` on every parameter is tiresome to use.
     return `  p${p.ord}: ${mapped.ts}`
   })
 
@@ -126,9 +117,8 @@ function emitQuery(
   const values =
     params.length > 0 ? `[${params.map((p) => `params.p${p.ord}`).join(', ')}]` : '[]'
 
-  // The query's own comment block becomes the function's JSDoc. Editors show it
-  // on hover at the call site, so a query documents itself all the way to
-  // whoever uses it, not just to whoever opens the .sql file.
+  // The query's comment block becomes the function's JSDoc, so editors show it
+  // on hover at the call site.
   const docLines = [
     ...query.doc,
     ...(query.doc.length > 0 ? [''] : []),
