@@ -16,7 +16,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "prepublishOnly": "npm run build"
+    "prepare": "tsc"
   },
   "dependencies": {
     "pg": "^8.13.0"
