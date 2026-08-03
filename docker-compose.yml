@@ -1,0 +1,22 @@
+services:
+  db:
+    build: .
+    image: pg_describe:17
+    container_name: pg-describe
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: pg_describe_demo
+    ports:
+      # Override the host port if 5432 is taken:  PGPORT=5433 docker compose up
+      - "${PGPORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pg_describe_demo"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+volumes:
+  pgdata:

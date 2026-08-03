@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  extension:
+    name: extension builds and passes pg_regress
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same image a user gets from `docker compose up`. If it passes here
+      # it passes on their machine, because it is the same image.
+      - name: build image and start server
+        run: docker compose up -d --build --wait db
+
+      - name: run the regression suite
+        run: |
+          docker compose exec -T db bash -lc '
+            cd /src/pg_describe &&
+            PGUSER=postgres PGHOST=/var/run/postgresql PGDATABASE=contrib_regression \
+            make installcheck'
+
+      # A failing suite is far more useful with the diff attached.
+      - name: show the diff on failure
+        if: failure()
+        run: docker compose exec -T db cat /src/pg_describe/regression.diffs || true
+
+  codegen:
+    name: codegen builds, generates and matches what is committed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: start server
+        run: docker compose up -d --build --wait db
+
+      - name: build the generator
+        working-directory: packages/codegen
+        run: |
+          npm install
+          npm run build
+
+      - name: load the example schema
+        run: docker compose exec -T db psql -U postgres -d pg_describe_demo -q < examples/typescript/schema.sql
+
+      - name: install the example
+        working-directory: examples/typescript
+        run: npm install
+
+      # The real assertion: regenerating against a live database must reproduce
+      # the file in the repository byte for byte. If the extension's output
+      # changes, or the emitter changes, or the schema drifts, this fails.
+      - name: generated output is up to date
+        working-directory: examples/typescript
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: pg_describe_demo
+        run: npx pg-describe-gen --check
+
+      - name: example typechecks
+        working-directory: examples/typescript
+        run: npx tsc --noEmit
+
+      - name: example runs
+        working-directory: examples/typescript
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: pg_describe_demo
+        run: node src/demo.ts

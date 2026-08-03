@@ -1,0 +1,20 @@
+# build artifacts
+*.o
+*.so
+*.bc
+results/
+regression.diffs
+regression.out
+tmp_check/
+
+# node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# editor and OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
