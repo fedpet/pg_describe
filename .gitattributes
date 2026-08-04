@@ -1,0 +1,7 @@
+# Keep the release archive (git archive, and so the PGXN distribution) to the
+# extension and what is needed to build, test and read it. The documentation
+# site is tooling for github.io, not something a person compiling the extension
+# should have to download -- its lockfile alone is three times the size of
+# everything else here.
+website/ export-ignore
+.gitattributes export-ignore
