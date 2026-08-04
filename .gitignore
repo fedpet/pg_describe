@@ -24,7 +24,8 @@ website/.docusaurus/
 *~
 .DS_Store
 
-# local environment, never committed
-.env
-.env.*
+# local environment, never committed. The wildcard covers whatever the file is
+# called this week -- naming it here would only advertise it, the repository
+# being public.
+.env*
 !.env.example
