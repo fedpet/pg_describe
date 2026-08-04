@@ -23,3 +23,8 @@ website/.docusaurus/
 *.swp
 *~
 .DS_Store
+
+# local environment, never committed
+.env
+.env.*
+!.env.example
