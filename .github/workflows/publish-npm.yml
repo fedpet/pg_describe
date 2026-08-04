@@ -1,0 +1,80 @@
+# Publishes pg-describe-gen to npm via trusted publishing (OIDC).
+#
+# No token is involved. GitHub mints a short-lived OIDC token for this specific
+# workflow, and npm accepts it because the package's trusted publisher settings
+# name this repository and this file. That matters here: the npm account uses a
+# passkey for 2FA, so interactive `npm publish` from a terminal cannot work at
+# all -- every release would otherwise need a throwaway all-packages token.
+#
+# The trusted publisher must be configured once, at
+# https://www.npmjs.com/package/pg-describe-gen/access, with:
+#
+#   organization or user : sajonaro
+#   repository           : pg_describe
+#   workflow filename    : publish-npm.yml     <- this file's name, exactly
+#   environment          : (leave blank)
+#
+# Rename this file and publishing breaks until the setting is updated to match.
+name: publish npm
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write        # required: lets the job request an OIDC token
+
+jobs:
+  publish:
+    name: publish pg-describe-gen
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # OIDC publishing needs npm 11.5.1+, newer than what Node 22 bundles.
+      - name: use an npm that speaks OIDC
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: install the workspace
+        run: npm ci
+
+      # A tag that disagrees with package.json means someone bumped one and not
+      # the other. Publishing the wrong version is not worth guessing about.
+      - name: version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./packages/codegen/package.json').version")"
+          echo "tag=$tag package.json=$pkg"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pg-describe-gen@$pkg"
+            exit 1
+          fi
+
+      # Re-running a tag should be harmless rather than a red build: npm rejects
+      # republishing a version, so skip when the registry already has it.
+      - name: already published?
+        id: check
+        run: |
+          pkg="$(node -p "require('./packages/codegen/package.json').version")"
+          if npm view "pg-describe-gen@$pkg" version >/dev/null 2>&1; then
+            echo "pg-describe-gen@$pkg is already on the registry; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Provenance is attached automatically under trusted publishing, which is
+      # what puts the verified badge on the npm page.
+      - name: publish
+        if: steps.check.outputs.skip == 'false'
+        run: npm publish --workspace pg-describe-gen

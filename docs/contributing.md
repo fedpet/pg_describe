@@ -81,3 +81,37 @@ Every push and pull request builds the extension image, runs `pg_regress`,
 builds the generator, regenerates the example against a live database and
 type-checks it, and builds the documentation site. The site deploys to GitHub
 Pages from `main`.
+
+## Releasing
+
+Both halves ship from one tag.
+
+```bash
+# bump packages/codegen/package.json to the new version first, then:
+git tag -a v1.1.0 -m "pg_describe 1.1.0"
+git push origin v1.1.0
+```
+
+The tag does two things:
+
+- **npm.** `.github/workflows/publish-npm.yml` publishes `pg-describe-gen` via
+  trusted publishing — GitHub mints a short-lived OIDC token, npm accepts it
+  because the package's trusted publisher names this repository and that
+  workflow file, and provenance is attached automatically. No token exists to
+  leak. The job refuses to run if the tag and `package.json` disagree, and skips
+  cleanly if the version is already on the registry.
+- **PGXN.** Build the distribution archive and upload it at
+  https://manager.pgxn.org/ — this step is manual, since PGXN has no API token
+  flow here.
+
+  ```bash
+  git archive --format=zip --prefix=pg_describe-1.1.0/ -o pg_describe-1.1.0.zip v1.1.0
+  ```
+
+  `website/` is `export-ignore`d, so the archive carries the extension and its
+  tests rather than the documentation toolchain.
+
+A release also needs `pg_describe.control`, `META.json` and the versioned file
+in `sql/` to agree on the number, and a matching
+`sql/pg_describe--<old>--<new>.sql` upgrade script when the SQL interface
+changes.
