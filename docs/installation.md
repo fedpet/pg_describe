@@ -6,9 +6,16 @@ sidebar_label: Installation
 
 ## Requirements
 
-**PostgreSQL 17.** That is what CI builds and tests on every commit. The code
-depends on `Query->rteperminfos`, which is PostgreSQL 16+, so 16 will probably
-work — but "probably" is not "tested", so it is not claimed.
+**PostgreSQL 17 or 18.** Both are what CI builds and tests on every commit. The
+code depends on `Query->rteperminfos`, which is PostgreSQL 16+, so 16 will
+probably work — but "probably" is not "tested", so it is not claimed.
+
+The two servers differ in one way that matters here. From v18 the parser
+interposes an `RTE_GROUP` range table entry between the target list and the
+range table whenever a query groups, so a grouping column resolves to the
+grouping step rather than to the relation it came from. `pg_describe` resolves
+through it, which is why a grouped column reports the same provenance and
+nullability on both servers.
 
 You need to be able to install extensions in the target database. On RDS, Cloud
 SQL and most managed Postgres you cannot; see [Credit](credit.md) for the tool

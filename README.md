@@ -3,7 +3,7 @@
 [![CI](https://github.com/sajonaro/pg_describe/actions/workflows/ci.yml/badge.svg)](https://github.com/sajonaro/pg_describe/actions/workflows/ci.yml)
 [![PGXN](https://img.shields.io/badge/PGXN-pg__describe-blue)](https://pgxn.org/dist/pg_describe/)
 [![npm](https://img.shields.io/npm/v/pg-describe-gen)](https://www.npmjs.com/package/pg-describe-gen)
-[![PostgreSQL 17](https://img.shields.io/badge/PostgreSQL-17-336791)](https://www.postgresql.org/)
+[![PostgreSQL 17 | 18](https://img.shields.io/badge/PostgreSQL-17%20%7C%2018-336791)](https://www.postgresql.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 **pg_describe reports what a query would return, without running it.**
@@ -60,7 +60,7 @@ pgxn install pg_describe
 CREATE EXTENSION pg_describe;
 ```
 
-Needs PostgreSQL 17 (16 will probably work, untested) and the ability to install
+Needs PostgreSQL 17 or 18 (16 will probably work, untested) and the ability to install
 extensions — see [Installation](docs/installation.md). For TypeScript types:
 
 ```bash
