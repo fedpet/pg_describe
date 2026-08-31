@@ -385,6 +385,45 @@ describe_columns(ReturnSetInfo *rsinfo, Query *query, List *tlist)
             {
                 RangeTblEntry *rte = rt_fetch(var->varno, query->rtable);
 
+#if PG_VERSION_NUM >= 180000
+
+                /*
+                 * From v18 the parser interposes an RTE_GROUP between the
+                 * target list and the range table whenever a query groups.
+                 * A grouping column in the target list is then a Var into
+                 * that RTE rather than into the relation it came from, and
+                 * rte->groupexprs holds the expression each one stands for.
+                 * Resolving through it is what lets a grouped column keep the
+                 * provenance and the attnotnull it reported before v18.
+                 *
+                 * A loop rather than one step: nothing promises the expression
+                 * behind a grouping entry is not itself a Var needing the same
+                 * treatment. Anything that is not a plain, same-level Var ends
+                 * the walk and leaves the column without provenance -- which is
+                 * the right answer for GROUP BY upper(email), whose output has
+                 * no source column to name.
+                 */
+                while (rte->rtekind == RTE_GROUP)
+                {
+                    Node *gexpr;
+
+                    if (var->varattno > list_length(rte->groupexprs))
+                        break;
+
+                    gexpr = (Node *) list_nth(rte->groupexprs, var->varattno - 1);
+
+                    if (!IsA(gexpr, Var))
+                        break;
+
+                    var = (Var *) gexpr;
+
+                    if (var->varlevelsup != 0 || var->varattno <= 0)
+                        break;
+
+                    rte = rt_fetch(var->varno, query->rtable);
+                }
+#endif
+
                 if (rte->rtekind == RTE_RELATION)
                 {
                     HeapTuple atup = SearchSysCache2(ATTNUM,

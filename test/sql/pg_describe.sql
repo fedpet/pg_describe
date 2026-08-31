@@ -121,6 +121,28 @@ SELECT base_not_null AND result_not_null AS ok
 FROM pg_describe('SELECT email, count(*) FROM users GROUP BY email')
 WHERE kind = 'column' AND ord = 1;
 
+-- A grouped column keeps its provenance. From v18 the parser puts an RTE_GROUP
+-- between the target list and the range table, so the Var in the target list
+-- names the grouping step rather than the relation; resolving through it is
+-- what keeps these two answers the same as they are without a GROUP BY.
+SELECT source_table::text = 'users' AND source_column = 'email' AS ok
+FROM pg_describe('SELECT email, count(*) FROM users GROUP BY email')
+WHERE kind = 'column' AND ord = 1;
+
+-- Grouping by an expression has no source column to name, with or without the
+-- grouping step in the way.
+SELECT source_table IS NULL AND source_column IS NULL AS ok
+FROM pg_describe('SELECT upper(email) FROM users GROUP BY upper(email)')
+WHERE kind = 'column' AND ord = 1;
+
+-- Resolving through the grouping step must not lose the outer join underneath
+-- it: b_val is NOT NULL and grouped, and still nullable because the join
+-- null-extends it.
+SELECT base_not_null AND NOT result_not_null AS ok
+FROM pg_describe(
+  'SELECT b.b_val, count(*) FROM a LEFT JOIN b ON b.a_id = a.id GROUP BY b.b_val')
+WHERE kind = 'column' AND ord = 1;
+
 -- The claim is not merely internally consistent -- it matches what the server
 -- actually does. Expected to be f, which is exactly what result_not_null said
 -- and what base_not_null did not.
