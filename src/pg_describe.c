@@ -28,6 +28,7 @@
 #include "access/sysattr.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_attribute.h"
+#include "catalog/pg_namespace.h"
 #include "miscadmin.h"
 #include "nodes/bitmapset.h"
 #include "nodes/nodeFuncs.h"
@@ -326,6 +327,352 @@ check_permissions(Query *query)
 }
 
 /* ------------------------------------------------------------------------
+ * Nullability of an expression
+ * --------------------------------------------------------------------- */
+
+#if PG_VERSION_NUM >= 180000
+
+/*
+ * The expression a Var into the grouping step stands for, or NULL if the Var
+ * does not point at one.
+ *
+ * From v18 the parser interposes an RTE_GROUP between the target list and the
+ * range table whenever a query groups. A grouped column in the target list is
+ * then a Var into that RTE rather than into the relation it came from, and
+ * rte->groupexprs holds the expression each one stands for. Everything that
+ * wants to know what a grouped column really is goes through here, so that
+ * provenance and nullability cannot disagree about it.
+ */
+static Node *
+grouping_step_expr(Query *query, Var *var)
+{
+    RangeTblEntry *rte;
+
+    if (var->varlevelsup != 0 || var->varattno <= 0)
+        return NULL;
+
+    rte = rt_fetch(var->varno, query->rtable);
+
+    if (rte->rtekind != RTE_GROUP ||
+        var->varattno > list_length(rte->groupexprs))
+        return NULL;
+
+    return (Node *) list_nth(rte->groupexprs, var->varattno - 1);
+}
+#endif
+
+/*
+ * Resolve a target-list Var to the relation column it came from.
+ *
+ * Returns false when there is none to name: a correlated reference, a whole-row
+ * or system column, or a Var into anything that is not a plain relation.
+ */
+static bool
+resolve_var_column(Query *query, Var *var, Oid *relid, AttrNumber *attno,
+                   Index *varno)
+{
+    RangeTblEntry *rte;
+
+#if PG_VERSION_NUM >= 180000
+
+    /*
+     * Resolve through the grouping step, which is what lets a grouped column
+     * keep the provenance and the attnotnull it reported before v18.
+     *
+     * A loop rather than one step: nothing promises the expression behind a
+     * grouping entry is not itself a Var needing the same treatment. Anything
+     * that is not a Var ends the walk without provenance -- the right answer
+     * for GROUP BY upper(email), whose output has no source column to name.
+     * Its nullability is a separate question, and expr_is_not_null answers it
+     * by recursing into that same expression.
+     */
+    for (;;)
+    {
+        Node *gexpr = grouping_step_expr(query, var);
+
+        if (gexpr == NULL)
+            break;
+        if (!IsA(gexpr, Var))
+            return false;
+
+        var = (Var *) gexpr;
+    }
+#endif
+
+    /*
+     * varlevelsup > 0 refers to an enclosing query's range table, so rt_fetch
+     * here would read the wrong entry. varattno <= 0 is a whole-row reference
+     * or a system column, with no pg_attribute row to consult.
+     */
+    if (var->varlevelsup != 0 || var->varattno <= 0)
+        return false;
+
+    rte = rt_fetch(var->varno, query->rtable);
+
+    if (rte->rtekind != RTE_RELATION)
+        return false;
+
+    *relid = rte->relid;
+    *attno = var->varattno;
+    *varno = var->varno;
+    return true;
+}
+
+/* Does this column's relation declare it NOT NULL? */
+static bool
+column_is_not_null(Oid relid, AttrNumber attno)
+{
+    HeapTuple atup;
+    bool      notnull;
+
+    /*
+     * Syscache rather than a query against pg_attribute: a hash lookup over a
+     * relation analysis has already locked.
+     */
+    atup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid), Int16GetDatum(attno));
+    if (!HeapTupleIsValid(atup))
+        return false;
+
+    notnull = ((Form_pg_attribute) GETSTRUCT(atup))->attnotnull;
+    ReleaseSysCache(atup);
+    return notnull;
+}
+
+/*
+ * count() is the one aggregate that never returns NULL: over no rows at all it
+ * returns 0, where every other aggregate returns NULL. Matched by name in
+ * pg_catalog rather than by a hardcoded OID, so that a user-defined "count"
+ * in another schema is not mistaken for it.
+ */
+static bool
+is_count_aggregate(Oid aggfnoid)
+{
+    char *name = get_func_name(aggfnoid);
+    bool  result;
+
+    if (name == NULL)
+        return false;
+
+    result = (strcmp(name, "count") == 0 &&
+              get_func_namespace(aggfnoid) == PG_CATALOG_NAMESPACE);
+    pfree(name);
+    return result;
+}
+
+static bool expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
+                             bool grouping_sets);
+
+/* Are every one of these expressions provably non-null? */
+static bool
+args_are_not_null(List *args, Query *query, Bitmapset *nullable,
+                  bool grouping_sets)
+{
+    ListCell *lc;
+
+    /*
+     * Vacuous truth would be wrong here. Strictness says a function returns
+     * NULL when an argument is NULL; with no arguments it says nothing at all
+     * about the result, so a zero-argument function is never proven non-null
+     * this way.
+     */
+    if (args == NIL)
+        return false;
+
+    foreach(lc, args)
+    {
+        if (!expr_is_not_null((Node *) lfirst(lc), query, nullable, grouping_sets))
+            return false;
+    }
+    return true;
+}
+
+/*
+ * Can this expression be proven never to evaluate to NULL?
+ *
+ * False means "not proven", never "can be NULL" -- so every node kind that is
+ * not understood falls through to the default and is reported unknown. That is
+ * the direction that matters: over-declaring a null costs one impossible check
+ * in the caller, under-declaring one costs a crash.
+ *
+ * The reasoning is the planner's own, not a heuristic. Strictness is recorded
+ * per function in pg_proc, and everything else here is a property of the node
+ * type rather than a guess about it.
+ */
+static bool
+expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
+                 bool grouping_sets)
+{
+    if (node == NULL)
+        return false;
+
+    /* Expressions nest arbitrarily deeply; this is the standard guard. */
+    check_stack_depth();
+
+    switch (nodeTag(node))
+    {
+        case T_Const:
+            return !((Const *) node)->constisnull;
+
+        case T_Var:
+        {
+            Oid         relid;
+            AttrNumber  attno;
+            Index       varno;
+
+#if PG_VERSION_NUM >= 180000
+
+            /*
+             * A Var into the grouping step stands for the expression grouped
+             * by, so that expression is what has to be proven. Without this,
+             * GROUP BY date_trunc('day', ts) over a NOT NULL column answers
+             * differently on v18 than on v17, where the target list holds the
+             * expression directly and this case is never reached.
+             *
+             * Not under grouping sets: a super-aggregate row nulls the grouped
+             * column however non-null the expression behind it, which is the
+             * same reason the plain column below is not proven there either.
+             */
+            if (!grouping_sets)
+            {
+                Node *gexpr = grouping_step_expr(query, (Var *) node);
+
+                if (gexpr != NULL)
+                    return expr_is_not_null(gexpr, query, nullable,
+                                            grouping_sets);
+            }
+#endif
+
+            if (!resolve_var_column(query, (Var *) node, &relid, &attno, &varno))
+                return false;
+
+            /*
+             * Non-null in the result only if non-null at the source and nothing
+             * downstream can null-extend it.
+             */
+            return column_is_not_null(relid, attno) &&
+                   !bms_is_member(varno, nullable) &&
+                   !grouping_sets;
+        }
+
+        /* NULL only when every argument is NULL, so one non-null suffices. */
+        case T_CoalesceExpr:
+        {
+            ListCell *lc;
+
+            foreach(lc, ((CoalesceExpr *) node)->args)
+            {
+                if (expr_is_not_null((Node *) lfirst(lc), query, nullable,
+                                     grouping_sets))
+                    return true;
+            }
+            return false;
+        }
+
+        /*
+         * Every arm must be non-null, the ELSE included. A CASE with no ELSE
+         * yields NULL when nothing matches, so its absence settles it.
+         */
+        case T_CaseExpr:
+        {
+            CaseExpr *caseexpr = (CaseExpr *) node;
+            ListCell *lc;
+
+            if (!expr_is_not_null((Node *) caseexpr->defresult, query, nullable,
+                                  grouping_sets))
+                return false;
+
+            foreach(lc, caseexpr->args)
+            {
+                CaseWhen *when = lfirst_node(CaseWhen, lc);
+
+                if (!expr_is_not_null((Node *) when->result, query, nullable,
+                                      grouping_sets))
+                    return false;
+            }
+            return true;
+        }
+
+        /* A strict function returns NULL only when an argument is NULL. */
+        case T_FuncExpr:
+        {
+            FuncExpr *func = (FuncExpr *) node;
+
+            return func_strict(func->funcid) &&
+                   args_are_not_null(func->args, query, nullable, grouping_sets);
+        }
+
+        case T_OpExpr:
+        {
+            OpExpr *op = (OpExpr *) node;
+
+            return func_strict(op->opfuncid) &&
+                   args_are_not_null(op->args, query, nullable, grouping_sets);
+        }
+
+        /* IS DISTINCT FROM is exactly the null-aware comparison: never NULL. */
+        case T_DistinctExpr:
+            return true;
+
+        /*
+         * NULLIF shares OpExpr's shape but is the opposite case: it returns
+         * NULL precisely when its arguments are equal, however non-null they
+         * are.
+         */
+        case T_NullIfExpr:
+            return false;
+
+        /*
+         * AND, OR and NOT are three-valued, but only NULL input produces NULL
+         * output, so non-null arguments give a non-null result.
+         */
+        case T_BoolExpr:
+            return args_are_not_null(((BoolExpr *) node)->args, query, nullable,
+                                     grouping_sets);
+
+        /* Tests answer true or false about a value, including about NULL. */
+        case T_NullTest:
+        case T_BooleanTest:
+            return true;
+
+        /* Constructing an array or a row yields a value, never NULL. */
+        case T_ArrayExpr:
+        case T_RowExpr:
+            return true;
+
+        /* Wrappers that change the label or representation, not the value. */
+        case T_RelabelType:
+            return expr_is_not_null((Node *) ((RelabelType *) node)->arg, query,
+                                    nullable, grouping_sets);
+        case T_CoerceViaIO:
+            return expr_is_not_null((Node *) ((CoerceViaIO *) node)->arg, query,
+                                    nullable, grouping_sets);
+        case T_ArrayCoerceExpr:
+            return expr_is_not_null((Node *) ((ArrayCoerceExpr *) node)->arg,
+                                    query, nullable, grouping_sets);
+        case T_CollateExpr:
+            return expr_is_not_null((Node *) ((CollateExpr *) node)->arg, query,
+                                    nullable, grouping_sets);
+        case T_CoerceToDomain:
+            return expr_is_not_null((Node *) ((CoerceToDomain *) node)->arg,
+                                    query, nullable, grouping_sets);
+
+        /*
+         * Only count(). Every other aggregate returns NULL over no rows, and
+         * over a group whose values are all NULL. Grouping sets do not change
+         * this: they null-extend grouping columns, not aggregates.
+         */
+        case T_Aggref:
+            return is_count_aggregate(((Aggref *) node)->aggfnoid);
+
+        case T_WindowFunc:
+            return is_count_aggregate(((WindowFunc *) node)->winfnoid);
+
+        default:
+            return false;
+    }
+}
+
+/* ------------------------------------------------------------------------
  * Columns
  * --------------------------------------------------------------------- */
 
@@ -374,90 +721,30 @@ describe_columns(ReturnSetInfo *rsinfo, Query *query, List *tlist)
          */
         if (IsA(tle->expr, Var))
         {
-            Var *var = (Var *) tle->expr;
+            Oid        relid;
+            AttrNumber attno;
+            Index      varno;
 
-            /*
-             * varlevelsup > 0 refers to an enclosing query's range table, so
-             * rt_fetch here would read the wrong entry. varattno <= 0 is a
-             * whole-row reference or system column, with no pg_attribute row.
-             */
-            if (var->varlevelsup == 0 && var->varattno > 0)
+            if (resolve_var_column(query, (Var *) tle->expr, &relid, &attno,
+                                   &varno))
             {
-                RangeTblEntry *rte = rt_fetch(var->varno, query->rtable);
-
-#if PG_VERSION_NUM >= 180000
-
-                /*
-                 * From v18 the parser interposes an RTE_GROUP between the
-                 * target list and the range table whenever a query groups.
-                 * A grouping column in the target list is then a Var into
-                 * that RTE rather than into the relation it came from, and
-                 * rte->groupexprs holds the expression each one stands for.
-                 * Resolving through it is what lets a grouped column keep the
-                 * provenance and the attnotnull it reported before v18.
-                 *
-                 * A loop rather than one step: nothing promises the expression
-                 * behind a grouping entry is not itself a Var needing the same
-                 * treatment. Anything that is not a plain, same-level Var ends
-                 * the walk and leaves the column without provenance -- which is
-                 * the right answer for GROUP BY upper(email), whose output has
-                 * no source column to name.
-                 */
-                while (rte->rtekind == RTE_GROUP)
-                {
-                    Node *gexpr;
-
-                    if (var->varattno > list_length(rte->groupexprs))
-                        break;
-
-                    gexpr = (Node *) list_nth(rte->groupexprs, var->varattno - 1);
-
-                    if (!IsA(gexpr, Var))
-                        break;
-
-                    var = (Var *) gexpr;
-
-                    if (var->varlevelsup != 0 || var->varattno <= 0)
-                        break;
-
-                    rte = rt_fetch(var->varno, query->rtable);
-                }
-#endif
-
-                if (rte->rtekind == RTE_RELATION)
-                {
-                    HeapTuple atup = SearchSysCache2(ATTNUM,
-                                                     ObjectIdGetDatum(rte->relid),
-                                                     Int16GetDatum(var->varattno));
-
-                    /*
-                     * Syscache rather than a query against pg_attribute: a hash
-                     * lookup over a relation analysis has already locked.
-                     */
-                    if (HeapTupleIsValid(atup))
-                    {
-                        Form_pg_attribute att = (Form_pg_attribute) GETSTRUCT(atup);
-
-                        source_table = rte->relid;
-                        source_column = pstrdup(NameStr(att->attname));
-                        base_not_null = att->attnotnull ? 1 : 0;
-
-                        /*
-                         * Non-null in the result only if non-null at the source
-                         * and nothing downstream can null-extend it.
-                         */
-                        if (base_not_null == 0)
-                            result_not_null = 0;
-                        else if (bms_is_member(var->varno, nullable) || grouping_sets)
-                            result_not_null = 0;
-                        else
-                            result_not_null = 1;
-
-                        ReleaseSysCache(atup);
-                    }
-                }
+                source_table = relid;
+                source_column = get_attname(relid, attno, true);
+                base_not_null = column_is_not_null(relid, attno) ? 1 : 0;
             }
         }
+
+        /*
+         * Nullability is asked of every expression, not just of columns. A
+         * column-backed one that is not proven non-null is definitely nullable
+         * -- the source and every join above it are known. Anything else is
+         * only reported when proven, because not proven is not the same as
+         * nullable, and unknown is the answer that fails safe.
+         */
+        if (expr_is_not_null((Node *) tle->expr, query, nullable, grouping_sets))
+            result_not_null = 1;
+        else if (source_table != InvalidOid)
+            result_not_null = 0;
 
         emit_row(rsinfo, "column", ord, tle->resname,
                  exprType((Node *) tle->expr),

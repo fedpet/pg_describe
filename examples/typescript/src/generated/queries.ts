@@ -131,8 +131,8 @@ export async function deleteOrdersBefore(client: ClientBase, params: DeleteOrder
 // ------------------------------------------------------------------------
 
 export interface DailyOrderTotalsRow {
-  day: Date | null
-  order_count: string | null
+  day: Date
+  order_count: string
   revenue: string | null
 }
 
@@ -144,9 +144,10 @@ GROUP BY 1
 ORDER BY 1 DESC`;
 
 /**
- * Expression columns have a type but no source column, so pg_describe reports
- * no provenance and the generator treats them as nullable — which is correct:
- * sum() over an empty group is NULL, and date_trunc could be too.
+ * Three expression columns, three different answers. None of them has a source
+ * column, so none has provenance — but nullability does not follow provenance:
+ * date_trunc is strict over a NOT NULL column and count() never returns NULL,
+ * while sum() over an empty group really is NULL and stays nullable.
  *
  * @see {@link dailyOrderTotalsSql} — defined in queries/orders.sql
  */

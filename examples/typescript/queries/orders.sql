@@ -37,9 +37,10 @@ DELETE FROM orders
 WHERE placed_at < $1;
 
 -- @name DailyOrderTotals
--- Expression columns have a type but no source column, so pg_describe reports
--- no provenance and the generator treats them as nullable — which is correct:
--- sum() over an empty group is NULL, and date_trunc could be too.
+-- Three expression columns, three different answers. None of them has a source
+-- column, so none has provenance — but nullability does not follow provenance:
+-- date_trunc is strict over a NOT NULL column and count() never returns NULL,
+-- while sum() over an empty group really is NULL and stays nullable.
 SELECT date_trunc('day', o.placed_at) AS day,
        count(*)                       AS order_count,
        sum(o.total)                   AS revenue

@@ -39,11 +39,108 @@ FROM pg_describe('SELECT email AS who FROM users') WHERE kind = 'column';
 SELECT count(*) = 1 AS ok
 FROM pg_describe('SELECT email FROM users ORDER BY id') WHERE kind = 'column';
 
--- An expression has a type but no source, and no opinion on nullability.
+-- An expression has a type but no source column to name. Its nullability is a
+-- separate question, answered below.
 SELECT source_table IS NULL AND source_column IS NULL
-   AND base_not_null IS NULL AND result_not_null IS NULL
+   AND base_not_null IS NULL
    AND type_name = 'text' AS ok
 FROM pg_describe('SELECT upper(email) FROM users') WHERE kind = 'column';
+
+-- ===========================================================================
+-- Nullability of expressions.
+--
+-- Everything here reports NULL -- unknown -- unless it is proven, so each pair
+-- of cases checks both that a provable one is proven and that the neighbouring
+-- unprovable one is not silently claimed.
+-- ===========================================================================
+
+-- A strict function returns NULL only when an argument is NULL, so over a
+-- NOT NULL column it cannot.
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT upper(email) FROM users') WHERE kind = 'column';
+
+-- The same function over a nullable column proves nothing.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT upper(note) FROM users') WHERE kind = 'column';
+
+-- Strictness composes through operators too.
+SELECT result_not_null AS ok
+FROM pg_describe($$SELECT email || '!' FROM users$$) WHERE kind = 'column';
+
+-- A zero-argument function is not proven by strictness: with no arguments the
+-- property says nothing about the result.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT random()') WHERE kind = 'column';
+
+-- COALESCE is NULL only when every argument is, so one non-null settles it.
+SELECT result_not_null AS ok
+FROM pg_describe($$SELECT coalesce(note, 'none') FROM users$$)
+WHERE kind = 'column';
+
+-- ... and two nullable arguments settle nothing.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT coalesce(note, note) FROM users')
+WHERE kind = 'column';
+
+-- A literal is non-null; a NULL literal is not.
+SELECT result_not_null AS ok
+FROM pg_describe($$SELECT 'hi'::text$$) WHERE kind = 'column';
+
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT NULL::text') WHERE kind = 'column';
+
+-- Every arm of a CASE must be non-null, the ELSE included.
+SELECT result_not_null AS ok
+FROM pg_describe($$SELECT CASE WHEN id > 0 THEN email ELSE 'x' END FROM users$$)
+WHERE kind = 'column';
+
+-- A CASE with no ELSE yields NULL when nothing matches.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT CASE WHEN id > 0 THEN email END FROM users')
+WHERE kind = 'column';
+
+-- count() returns 0 over no rows; every other aggregate returns NULL.
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT count(*) FROM users') WHERE kind = 'column';
+
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT sum(id) FROM users') WHERE kind = 'column';
+
+-- As a window function too.
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT count(*) OVER () FROM users') WHERE kind = 'column';
+
+-- A test answers true or false about a value, including about NULL.
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT note IS NULL FROM users') WHERE kind = 'column';
+
+-- IS DISTINCT FROM is the null-aware comparison, so it is never NULL...
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT email IS DISTINCT FROM note FROM users')
+WHERE kind = 'column';
+
+-- ... while NULLIF shares its shape and is the opposite case, returning NULL
+-- precisely when its arguments are equal, however non-null they are.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe($$SELECT nullif(email, 'x') FROM users$$) WHERE kind = 'column';
+
+-- Constructing an array yields a value, never NULL.
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT ARRAY[email] FROM users') WHERE kind = 'column';
+
+-- The load-bearing case. b_val is NOT NULL, so strictness would prove upper()
+-- of it non-null -- but the outer join null-extends it, and the Var underneath
+-- the expression is what carries that. An implementation that reasoned about
+-- the function without reaching the column would claim non-null here and hand
+-- back a crash.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT upper(b.b_val) FROM a LEFT JOIN b ON b.a_id = a.id')
+WHERE kind = 'column';
+
+-- Same for grouping sets, which null-extend the grouping column underneath.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT upper(email) FROM users GROUP BY ROLLUP(email)')
+WHERE kind = 'column';
 
 -- ===========================================================================
 -- Nullability. This is what pg_describe has that attnotnull alone does not.
@@ -133,6 +230,21 @@ WHERE kind = 'column' AND ord = 1;
 -- grouping step in the way.
 SELECT source_table IS NULL AND source_column IS NULL AS ok
 FROM pg_describe('SELECT upper(email) FROM users GROUP BY upper(email)')
+WHERE kind = 'column' AND ord = 1;
+
+-- Having no source column does not make it unknown. The expression is still
+-- there to be proven, and grouping does not change what upper() of a NOT NULL
+-- column can return. This is also the version parity case: before v18 the
+-- target list holds the FuncExpr itself, from v18 it holds a Var into the
+-- grouping step, and both have to answer the same.
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT upper(email) FROM users GROUP BY upper(email)')
+WHERE kind = 'column' AND ord = 1;
+
+-- The same expression under grouping sets is not proven, because a
+-- super-aggregate row nulls the grouped column whatever produced it.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT upper(email) FROM users GROUP BY ROLLUP(upper(email))')
 WHERE kind = 'column' AND ord = 1;
 
 -- Resolving through the grouping step must not lose the outer join underneath

@@ -105,8 +105,9 @@ one of the two files was updated.
 
 ## Expression columns
 
-Expressions have a type but no source column, so no nullability can be proven
-and the generator emits `T | null`:
+An expression has no source column, so pg_describe reports no provenance for
+it. Nullability is a separate question, and one it answers from the expression
+itself:
 
 ```sql
 -- @name DailyOrderTotals
@@ -119,11 +120,13 @@ GROUP BY 1;
 
 ```typescript
 export interface DailyOrderTotalsRow {
-  day: Date | null
-  order_count: string | null
+  day: Date
+  order_count: string
   revenue: string | null
 }
 ```
 
-Which is correct rather than merely cautious: `sum()` over an empty group really
-is NULL.
+Three expressions, three different answers. `date_trunc` is strict and
+`placed_at` is `NOT NULL`, so `day` cannot be NULL. `count()` returns 0 rather
+than NULL over no rows. `sum()` over an empty group really is NULL, so
+`revenue` keeps the union -- correct rather than merely cautious.

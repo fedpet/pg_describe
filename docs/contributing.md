@@ -31,9 +31,9 @@ docker compose exec db bash -lc \
    PGDATABASE=contrib_regression make installcheck'
 ```
 
-32 assertions covering parameter inference, provenance, join shapes and their
-nesting, grouping sets, statement shapes, error handling and four permission
-scenarios. `regression.diffs` holds the failure detail.
+53 assertions covering parameter inference, provenance, expression
+nullability, join shapes and their nesting, grouping sets, statement shapes,
+error handling and four permission scenarios. `regression.diffs` holds the failure detail.
 
 A change to the analysis belongs with a test in `test/sql/pg_describe.sql` and
 its expected output — the suite is the specification of what the flags mean.
