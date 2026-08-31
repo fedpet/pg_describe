@@ -8,8 +8,16 @@ on:
 
 jobs:
   extension:
-    name: extension builds and passes pg_regress
+    name: extension builds and passes pg_regress (PG ${{ matrix.pg_major }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every server the extension claims to support. v18 moved grouped
+        # columns behind an RTE_GROUP, which only a build against 18 catches.
+        pg_major: ["17", "18"]
+    env:
+      PG_MAJOR: ${{ matrix.pg_major }}
     steps:
       - uses: actions/checkout@v4
 
