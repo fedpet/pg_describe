@@ -14,7 +14,8 @@ pg_describe(sql text) RETURNS TABLE (
   source_table    regclass,  -- NULL unless the column is a plain column reference
   source_column   text,
   base_not_null   boolean,   -- attnotnull on the source column
-  result_not_null boolean    -- can this result column be NULL. Use this one.
+  result_not_null boolean,   -- can this result column be NULL. Use this one.
+  result_shape    jsonb      -- recursive shape for constructed JSON/JSONB
 )
 ```
 
@@ -33,6 +34,19 @@ One row per parameter, then one row per result column.
 
 Parameter rows carry only `type_oid` and `type_name`; the remaining columns are
 NULL.
+
+## JSON result shapes
+
+`result_shape` is NULL for non-JSON columns. For JSON and JSONB it has four
+recursive variants: `unknown`, `scalar`, `array`, and `object`. Scalar leaves
+retain the PostgreSQL type, provenance, base nullability, and result
+nullability. Arrays carry their element shape. Objects carry ordered named
+fields, optionality, and an `additional` value shape for dynamic keys.
+
+Stored JSON columns, parameters, path/query functions, and other values whose
+contents cannot be known without executing the statement report `unknown`.
+JSON produced by PostgreSQL's constructors is described recursively, including
+SQL arrays and composite values embedded in it.
 
 ## Which columns are described
 

@@ -5,6 +5,14 @@ CREATE TABLE a (id int PRIMARY KEY, a_val text NOT NULL);
 CREATE TABLE b (id int PRIMARY KEY, a_id int, b_val text NOT NULL);
 CREATE TABLE c (id int PRIMARY KEY, b_id int, c_val text NOT NULL);
 CREATE TABLE users (id int PRIMARY KEY, email text NOT NULL, note text);
+CREATE TABLE json_membership (
+  user_id int PRIMARY KEY REFERENCES users(id),
+  property_id int NOT NULL,
+  approved boolean NOT NULL,
+  permissions text[] NOT NULL,
+  external_ids uuid[] NOT NULL
+);
+CREATE TABLE json_property (id int PRIMARY KEY, name text NOT NULL);
 -- ===========================================================================
 -- Parameters: inferred, with nothing declared.
 -- ===========================================================================
@@ -433,6 +441,119 @@ FROM a LEFT JOIN b ON b.a_id = a.id;
 (1 row)
 
 DELETE FROM a;
+-- ===========================================================================
+-- Recursive shapes for constructed JSON/JSONB.
+-- ===========================================================================
+-- Non-JSON columns have no shape; arbitrary stored JSON has an explicit
+-- unknown shape rather than a guessed one.
+SELECT result_shape IS NULL AS ok
+FROM pg_describe('SELECT email FROM users') WHERE kind = 'column';
+ ok 
+----
+ t
+(1 row)
+
+SELECT result_shape = '{"kind":"unknown"}'::jsonb AS ok
+FROM pg_describe('SELECT $1::json') WHERE kind = 'column';
+ ok 
+----
+ t
+(1 row)
+
+-- Legacy constructors preserve field order, scalar runtime kinds, and SQL
+-- arrays recursively. uuid[] is an array here even though some drivers return
+-- a top-level uuid[] column as a raw PostgreSQL literal.
+SELECT result_shape #>> '{kind}' = 'array'
+   AND result_shape #>> '{element,kind}' = 'object'
+   AND result_shape #>> '{element,fields,0,name}' = 'id'
+   AND result_shape #>> '{element,fields,0,shape,runtime}' = 'number'
+   AND result_shape #>> '{element,fields,1,name}' = 'permissions'
+   AND result_shape #>> '{element,fields,1,shape,kind}' = 'array'
+   AND result_shape #>> '{element,fields,2,shape,kind}' = 'array' AS ok
+FROM pg_describe(
+  $$SELECT json_build_array(json_build_object(
+       'id', user_id,
+       'permissions', permissions,
+       'external_ids', external_ids))
+    FROM json_membership$$)
+WHERE kind = 'column';
+ ok 
+----
+ t
+(1 row)
+
+-- The empty-array COALESCE fallback is neutral and makes the aggregate result
+-- non-null without erasing its element shape.
+SELECT result_shape #>> '{kind}' = 'array'
+   AND (result_shape #>> '{result_not_null}')::boolean
+   AND result_shape #>> '{element,fields,0,name}' = 'id' AS ok
+FROM pg_describe(
+  $$SELECT coalesce(
+       json_agg(json_build_object('id', p.id))
+         FILTER (WHERE p.id IS NOT NULL),
+       '[]'::json)
+    FROM users u
+    LEFT JOIN json_membership m ON m.user_id = u.id
+    LEFT JOIN json_property p ON p.id = m.property_id$$)
+WHERE kind = 'column';
+ ok 
+----
+ t
+(1 row)
+
+-- p.id proves the second LEFT JOIN matched. Its strict equality then proves
+-- m matched too, so fields from both nullable arms become non-null.
+SELECT (result_shape #>>
+          '{element,fields,0,shape,result_not_null}')::boolean
+   AND (result_shape #>>
+          '{element,fields,1,shape,result_not_null}')::boolean AS ok
+FROM pg_describe(
+  $$SELECT json_agg(json_build_object(
+       'property', p.name,
+       'approved', m.approved)) FILTER (WHERE p.id IS NOT NULL)
+    FROM users u
+    LEFT JOIN json_membership m ON m.user_id = u.id
+    LEFT JOIN json_property p ON p.id = m.property_id$$)
+WHERE kind = 'column';
+ ok 
+----
+ t
+(1 row)
+
+-- SQL/JSON constructors use their dedicated PostgreSQL 18 parse nodes. The
+-- fallback keeps the same regression file runnable on PostgreSQL 17.
+SELECT CASE WHEN current_setting('server_version_num')::int >= 180000
+       THEN result_shape #>> '{kind}' = 'object'
+        AND (result_shape #>> '{fields,0,optional}')::boolean
+       ELSE result_shape #>> '{kind}' = 'object'
+       END AS ok
+FROM pg_describe(
+  CASE WHEN current_setting('server_version_num')::int >= 180000
+       THEN $$SELECT json_object('id' VALUE id ABSENT ON NULL RETURNING jsonb)
+              FROM users$$
+       ELSE $$SELECT json_build_object('id', id) FROM users$$
+  END)
+WHERE kind = 'column';
+ ok 
+----
+ t
+(1 row)
+
+-- Names are not enough: a user function which shadows a constructor is not a
+-- PostgreSQL constructor and must stay unknown.
+CREATE FUNCTION public.json_build_object(text, text) RETURNS json
+LANGUAGE SQL IMMUTABLE AS $$SELECT '{}'::json$$;
+SET search_path = public, pg_catalog;
+SELECT result_shape = '{"kind":"unknown"}'::jsonb AS ok
+FROM pg_describe('SELECT json_build_object(email, email) FROM users')
+WHERE kind = 'column';
+ ok 
+----
+ t
+(1 row)
+
+RESET search_path;
+DROP FUNCTION public.json_build_object(text, text);
 -- ===========================================================================
 -- Statement shapes.
 -- ===========================================================================

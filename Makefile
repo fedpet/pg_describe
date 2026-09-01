@@ -9,7 +9,9 @@
 # You do not need this if you are using the Docker image, which runs it for you.
 
 EXTENSION    = pg_describe
-DATA         = sql/pg_describe--1.0.0.sql
+DATA         = sql/pg_describe--1.0.0.sql \
+               sql/pg_describe--1.0.0--1.1.0.sql \
+               sql/pg_describe--1.1.0.sql
 MODULE_big   = pg_describe
 OBJS         = src/pg_describe.o
 REGRESS      = pg_describe

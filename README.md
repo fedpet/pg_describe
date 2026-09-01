@@ -6,7 +6,8 @@
 [![PostgreSQL 17 | 18](https://img.shields.io/badge/PostgreSQL-17%20%7C%2018-336791)](https://www.postgresql.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-**pg_describe reports what a query would return, without running it.**
+**pg_describe reports what a query would return, without running it.** That now
+includes recursive shapes for JSON assembled by PostgreSQL constructors.
 
 ```sql
 SELECT * FROM pg_describe('SELECT id, email FROM users WHERE id = $1');
@@ -30,6 +31,8 @@ SELECT * FROM pg_describe('SELECT id, email FROM users WHERE id = $1');
   `LEFT JOIN` is reported nullable even when it is declared `NOT NULL`. Tools
   that read `attnotnull` alone get this wrong.
 - **Column provenance** — the source table and column behind each result field.
+- **Structural JSON results** — nested objects and arrays built in SQL retain
+  scalar types, provenance, and nullability for code generators.
 - **One round trip.** It is an ordinary `SELECT`, callable from any client in
   any language, with no wire-protocol code to write.
 - **Privileges are enforced**, so it cannot be used to read a schema the caller

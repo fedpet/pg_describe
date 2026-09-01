@@ -1,16 +1,16 @@
 {
    "name": "pg_describe",
    "abstract": "Report what a query would return, without executing it",
-   "description": "Runs PostgreSQL's own parser and analyser over a statement and stops before the executor, reporting the inferred type of every parameter and the name, type, source column and nullability of every result column. This is the server-side equivalent of sending Parse/Describe over the extended query protocol without Bind or Execute, as pgTyped, sqlc and sqlx do. Unlike tools that read pg_attribute.attnotnull alone, it walks the query's join tree, so a column on the nullable side of an outer join is correctly reported as nullable. Ships with a TypeScript code generator.",
-   "version": "1.0.0",
+   "description": "Runs PostgreSQL's own parser and analyser over a statement and stops before the executor, reporting the inferred type of every parameter and the name, type, source column, nullability and analyzable JSON shape of every result column. This is the server-side equivalent of sending Parse/Describe over the extended query protocol without Bind or Execute, as pgTyped, sqlc and sqlx do. Unlike tools that read pg_attribute.attnotnull alone, it walks the query's join tree, so a column on the nullable side of an outer join is correctly reported as nullable. Ships with a TypeScript code generator.",
+   "version": "1.1.0",
    "maintainer": ["sajonaro <9197624+sajonaro@users.noreply.github.com>"],
    "license": "mit",
    "provides": {
       "pg_describe": {
          "abstract": "Report what a query would return, without executing it",
-         "file": "sql/pg_describe--1.0.0.sql",
+         "file": "sql/pg_describe--1.1.0.sql",
          "docfile": "README.md",
-         "version": "1.0.0"
+         "version": "1.1.0"
       }
    },
    "prereqs": {
