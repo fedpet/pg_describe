@@ -1631,6 +1631,12 @@ append_shape_json(StringInfo buffer, JsonShape *shape)
             appendStringInfo(buffer, "%u", shape->source_table);
         else
             appendStringInfoString(buffer, "null");
+        append_json_string_property(buffer, "source_schema",
+            OidIsValid(shape->source_table) ?
+            get_namespace_name(get_rel_namespace(shape->source_table)) : NULL);
+        append_json_string_property(buffer, "source_relation",
+            OidIsValid(shape->source_table) ?
+            get_rel_name(shape->source_table) : NULL);
         append_json_string_property(buffer, "source_column",
                                     shape->source_column);
         append_json_nullable(buffer, "base_not_null", shape->base_not_null);
