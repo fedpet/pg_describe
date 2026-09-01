@@ -1556,6 +1556,34 @@ describe_json_value(Node *node, Query *query, Bitmapset *nullable,
                     nullable, grouping_sets));
             return shape;
         }
+        case T_SubLink:
+        {
+            SubLink    *link = (SubLink *) node;
+            Query      *subquery;
+            Bitmapset  *subquery_nullable = NULL;
+            ListCell   *lc;
+
+            if (link->subLinkType != EXPR_SUBLINK ||
+                link->subselect == NULL || !IsA(link->subselect, Query))
+                return unknown_shape();
+            subquery = (Query *) link->subselect;
+            find_nullable((Node *) subquery->jointree, &subquery_nullable);
+            foreach(lc, subquery->targetList)
+            {
+                TargetEntry *entry = lfirst_node(TargetEntry, lc);
+                JsonShape   *shape;
+
+                if (entry->resjunk)
+                    continue;
+                shape = describe_json_value((Node *) entry->expr, subquery,
+                    subquery_nullable, subquery->groupingSets != NIL);
+                /* A scalar subquery with no row produces SQL NULL. */
+                if (shape->kind != PD_SHAPE_UNKNOWN)
+                    shape->result_not_null = 0;
+                return shape;
+            }
+            return unknown_shape();
+        }
         case T_RowExpr:
             return describe_row((RowExpr *) node, query, nullable,
                                 grouping_sets);

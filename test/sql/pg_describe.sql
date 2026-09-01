@@ -301,6 +301,17 @@ FROM pg_describe(
     FROM json_membership$$)
 WHERE kind = 'column';
 
+-- Scalar subqueries keep the shape of their single JSON result. This is the
+-- common form for correlated nested lists in a larger projection.
+SELECT result_shape #>> '{kind}' = 'array'
+   AND result_shape #>> '{element,fields,0,name}' = 'id' AS ok
+FROM pg_describe(
+  $$SELECT coalesce(
+       (SELECT json_agg(json_build_object('id', p.id))
+        FROM json_property p),
+       '[]'::json)$$)
+WHERE kind = 'column';
+
 -- The empty-array COALESCE fallback is neutral and makes the aggregate result
 -- non-null without erasing its element shape.
 SELECT result_shape #>> '{kind}' = 'array'
