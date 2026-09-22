@@ -11,6 +11,8 @@ export interface DescribeRow {
   sourceColumn: string | null
   baseNotNull: boolean | null
   resultNotNull: boolean | null
+  arrayDimensions: number | null
+  arrayElementNotNull: boolean | null
   resultShape: unknown | null
 }
 
@@ -22,7 +24,7 @@ export interface Described {
 const SQL = `
   SELECT kind, ord, name, type_oid, type_name,
          source_table::text AS source_table,
-         source_column, base_not_null, result_not_null, result_shape
+         source_column, base_not_null, result_not_null, result_shape, array_dimensions, array_element_not_null
   FROM pg_describe($1)
   ORDER BY ord
 `
@@ -47,6 +49,8 @@ export async function describe(client: ClientBase, sql: string): Promise<Describ
     sourceColumn: (r.source_column as string | null) ?? null,
     baseNotNull: (r.base_not_null as boolean | null) ?? null,
     resultNotNull: (r.result_not_null as boolean | null) ?? null,
+    arrayDimensions: typeof r.array_dimensions === 'number' ? r.array_dimensions : null,
+    arrayElementNotNull: typeof r.array_element_not_null === 'boolean' ? r.array_element_not_null : null,
     resultShape: r.result_shape ?? null,
   }))
 

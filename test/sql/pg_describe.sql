@@ -10,8 +10,8 @@ CREATE TABLE json_membership (
   user_id int PRIMARY KEY REFERENCES users(id),
   property_id int NOT NULL,
   approved boolean NOT NULL,
-  permissions text[] NOT NULL,
-  external_ids uuid[] NOT NULL
+  permissions text[] NOT NULL CHECK (CASE WHEN permissions IS NULL THEN TRUE WHEN cardinality(permissions) = 0 THEN TRUE WHEN array_ndims(permissions) = 1 THEN array_position(permissions, NULL) IS NULL ELSE FALSE END),
+  external_ids uuid[] NOT NULL CHECK (CASE WHEN external_ids IS NULL THEN TRUE WHEN cardinality(external_ids) = 0 THEN TRUE WHEN array_ndims(external_ids) = 1 THEN array_position(external_ids, NULL) IS NULL ELSE FALSE END)
 );
 CREATE TABLE json_property (id int PRIMARY KEY, name text NOT NULL);
 
@@ -442,3 +442,40 @@ REVOKE ALL ON users FROM pd_nobody;
 REVOKE ALL ON SCHEMA public FROM pd_nobody;
 REVOKE ALL ON FUNCTION pg_describe(text) FROM pd_nobody;
 DROP ROLE pd_nobody;
+
+-- SQL type declarations do not enforce array rank or element nullability.
+CREATE TABLE pd_arrays (
+  unchecked integer[][],
+  checked integer[] CHECK (CASE WHEN checked IS NULL THEN TRUE
+    WHEN cardinality(checked) = 0 THEN TRUE
+    WHEN array_ndims(checked) = 1 THEN array_position(checked, NULL) IS NULL
+    ELSE FALSE END),
+  pending integer[]
+);
+ALTER TABLE pd_arrays ADD CHECK (CASE WHEN pending IS NULL THEN TRUE
+  WHEN cardinality(pending) = 0 THEN TRUE
+  WHEN array_ndims(pending) = 1 THEN array_position(pending, NULL) IS NULL
+  ELSE FALSE END) NOT VALID;
+SELECT name, array_dimensions, array_element_not_null
+FROM pg_describe('select unchecked, checked, pending from pd_arrays') WHERE kind = 'column';
+SELECT name, array_dimensions, array_element_not_null
+FROM pg_describe('select array[1,2] as flat, array[1,null] as nullable, array[[1,2],[3,4]] as nested, array[]::int[] as empty') WHERE kind = 'column';
+CREATE DOMAIN pd_flat AS integer[] CHECK (CASE WHEN VALUE IS NULL THEN TRUE
+  WHEN cardinality(VALUE) = 0 THEN TRUE
+  WHEN array_ndims(VALUE) = 1 THEN array_position(VALUE, NULL) IS NULL
+  ELSE FALSE END);
+CREATE DOMAIN pd_flat_chain AS pd_flat;
+SELECT name, array_dimensions, array_element_not_null
+FROM pg_describe('select unchecked::pd_flat_chain as domain, array_agg(checked) as nested, array_agg(unchecked) as unknown from pd_arrays group by unchecked') WHERE kind = 'column';
+SELECT name, array_dimensions, array_element_not_null
+FROM pg_describe('select array_agg(v) as nullable, array_agg(v) filter(where v is not null) as filtered from (values(1),(null)) t(v)') WHERE kind = 'column';
+SELECT name, array_dimensions, array_element_not_null
+FROM pg_describe('select array(select v from (values(1),(null)) t(v) where v is not null) as filtered') WHERE kind = 'column';
+CREATE FUNCTION pd_null(integer) RETURNS integer LANGUAGE sql STRICT AS 'select null::integer';
+SELECT result_not_null IS NOT TRUE AS ok FROM pg_describe('select pd_null(1)') WHERE kind = 'column';
+SELECT result_shape ->> 'kind' = 'unknown' AS ok
+FROM pg_describe('select to_json(unchecked) from pd_arrays') WHERE kind = 'column';
+DROP FUNCTION pd_null(integer);
+DROP DOMAIN pd_flat_chain;
+DROP DOMAIN pd_flat;
+DROP TABLE pd_arrays;

@@ -171,3 +171,26 @@ language, and nullability that accounts for outer joins. See
 ## License
 
 MIT © 2026-present, see [LICENSE](LICENSE).
+
+### Array facts on the integration branch
+
+`array_dimensions` and `array_element_not_null` describe SQL array results.
+NULL means unknown; rank zero is the empty array. PostgreSQL's type OID and
+`format_type` spelling do not encode rank, and a column declared `integer[][]`
+can store flat or nested values. Constructors, constant arrays, `ARRAY(SELECT)`,
+`array_agg`, and compatible CASE/COALESCE arms carry provable facts. A validated,
+enforced table or domain CHECK in this canonical form proves a flat array
+without NULL elements (the whole value can still be NULL):
+
+```sql
+CHECK (CASE WHEN value IS NULL THEN TRUE
+  WHEN cardinality(value) = 0 THEN TRUE
+  WHEN array_ndims(value) = 1 THEN array_position(value, NULL) IS NULL
+  ELSE FALSE END)
+```
+
+Use the column name for `value` in table constraints, or `VALUE` in domain
+constraints. Unknown-rank SQL arrays converted to JSON have an unknown shape.
+`STRICT` alone is not a non-null-result proof: user functions may return NULL
+for non-null arguments. Only specifically recognised builtins carry that proof.
+The integration API is updated in place; no upgrade compatibility is promised.

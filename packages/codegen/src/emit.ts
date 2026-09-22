@@ -52,7 +52,18 @@ function emitRowInterface(
   unmapped: Set<string>,
 ): string {
   const fields = columns.map((col, i) => {
-    const mapped = tsTypeFor(col.typeName, opts.types)
+    let mapped = tsTypeFor(col.typeName, opts.types)
+    if (col.typeName.endsWith('[]') && opts.types?.[col.typeName] === undefined) {
+      if (col.arrayDimensions === null) mapped = { ts: 'unknown', unmapped: true }
+      else {
+        const element = tsTypeFor(col.typeName.slice(0, -2), opts.types)
+        let ts = col.arrayElementNotNull === true ? element.ts : `${element.ts} | null`
+        for (let depth = 0; depth < Math.max(1, col.arrayDimensions); depth++) {
+          ts = ts.includes('|') ? `(${ts})[]` : `${ts}[]`
+        }
+        mapped = { ts, unmapped: element.unmapped }
+      }
+    }
     if (mapped.unmapped) unmapped.add(col.typeName)
 
     const key = propertyKey(col.name ?? `column${i + 1}`)

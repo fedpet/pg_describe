@@ -25,6 +25,14 @@
 #include "funcapi.h"
 
 #include "access/htup_details.h"
+#include "access/genam.h"
+#include "access/table.h"
+#include "catalog/pg_constraint.h"
+#include "catalog/pg_type.h"
+#include "nodes/makefuncs.h"
+#include "nodes/readfuncs.h"
+#include "utils/fmgroids.h"
+#include "utils/rel.h"
 #include "access/sysattr.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_attribute.h"
@@ -48,7 +56,7 @@
 
 PG_MODULE_MAGIC;
 
-/* The ten columns declared by RETURNS TABLE, in order. */
+/* The columns declared by RETURNS TABLE, in order. */
 #define PD_COL_KIND             0
 #define PD_COL_ORD              1
 #define PD_COL_NAME             2
@@ -59,7 +67,9 @@ PG_MODULE_MAGIC;
 #define PD_COL_BASE_NOT_NULL    7
 #define PD_COL_RESULT_NOT_NULL  8
 #define PD_COL_RESULT_SHAPE     9
-#define PD_NCOLS                10
+#define PD_COL_ARRAY_DIMENSIONS 10
+#define PD_COL_ELEMENT_NOT_NULL 11
+#define PD_NCOLS                12
 
 /*
  * Nullability flags are tri-state: true, false, unknown. An expression column
@@ -82,7 +92,7 @@ emit_row(ReturnSetInfo *rsinfo,
          const char *source_column,
          int base_not_null,
          int result_not_null,
-         Jsonb *result_shape)
+         Jsonb *result_shape, int array_dimensions, int element_not_null)
 {
     Datum values[PD_NCOLS];
     bool  nulls[PD_NCOLS];
@@ -148,6 +158,16 @@ emit_row(ReturnSetInfo *rsinfo,
         nulls[PD_COL_RESULT_SHAPE] = false;
     }
 
+    if (array_dimensions != PD_UNKNOWN)
+    {
+        values[PD_COL_ARRAY_DIMENSIONS] = Int32GetDatum(array_dimensions);
+        nulls[PD_COL_ARRAY_DIMENSIONS] = false;
+    }
+    if (element_not_null != PD_UNKNOWN)
+    {
+        values[PD_COL_ELEMENT_NOT_NULL] = BoolGetDatum(element_not_null != 0);
+        nulls[PD_COL_ELEMENT_NOT_NULL] = false;
+    }
     tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 
@@ -472,6 +492,34 @@ is_count_aggregate(Oid aggfnoid)
     return result;
 }
 
+/* STRICT is only the implication NULL input -> NULL output. */
+static bool
+known_nonnull_function(Oid function)
+{
+    static const char *const names[] = {
+        "upper", "lower", "length", "char_length", "btrim", "ltrim", "rtrim",
+        "date_trunc", "textcat", "int2", "int4", "int8", "float4", "float8",
+        "numeric", "text", "varchar", "date", "timestamp", "timestamptz",
+        "int2eq", "int2ne", "int2lt", "int2le", "int2gt", "int2ge",
+        "int4eq", "int4ne", "int4lt", "int4le", "int4gt", "int4ge",
+        "int8eq", "int8ne", "int8lt", "int8le", "int8gt", "int8ge",
+        "texteq", "textne", "text_lt", "text_le", "text_gt", "text_ge",
+        "uuid_eq", "uuid_ne", "uuid_lt", "uuid_le", "uuid_gt", "uuid_ge",
+        "int4pl", "int4mi", "int4mul", "int4div", "int8pl", "int8mi",
+        "booland_statefunc", "boolor_statefunc", "booleq", "boolne"
+    };
+    char *name;
+    int i;
+
+    if (get_func_namespace(function) != PG_CATALOG_NAMESPACE)
+        return false;
+    name = get_func_name(function);
+    for (i = 0; i < lengthof(names); i++)
+        if (name != NULL && strcmp(name, names[i]) == 0)
+            return true;
+    return false;
+}
+
 static bool expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
                              bool grouping_sets);
 
@@ -605,12 +653,12 @@ expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
             return true;
         }
 
-        /* A strict function returns NULL only when an argument is NULL. */
+        /* Prove both implications, not just the STRICT input rule. */
         case T_FuncExpr:
         {
             FuncExpr *func = (FuncExpr *) node;
 
-            return func_strict(func->funcid) &&
+            return known_nonnull_function(func->funcid) && func_strict(func->funcid) &&
                    args_are_not_null(func->args, query, nullable, grouping_sets);
         }
 
@@ -618,7 +666,7 @@ expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
         {
             OpExpr *op = (OpExpr *) node;
 
-            return func_strict(op->opfuncid) &&
+            return known_nonnull_function(op->opfuncid) && func_strict(op->opfuncid) &&
                    args_are_not_null(op->args, query, nullable, grouping_sets);
         }
 
@@ -657,8 +705,7 @@ expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
             return expr_is_not_null((Node *) ((RelabelType *) node)->arg, query,
                                     nullable, grouping_sets);
         case T_CoerceViaIO:
-            return expr_is_not_null((Node *) ((CoerceViaIO *) node)->arg, query,
-                                    nullable, grouping_sets);
+            return false;
         case T_ArrayCoerceExpr:
             return expr_is_not_null((Node *) ((ArrayCoerceExpr *) node)->arg,
                                     query, nullable, grouping_sets);
@@ -986,6 +1033,314 @@ nullable_for_aggregate(Query *query, Node *filter)
     return nullable;
 }
 
+static bool pg_function_named(Oid function, const char *name);
+static Node *first_aggregate_argument(Aggref *aggregate);
+/* Array facts describe successful, non-null results. Rank 0 is an empty array
+ * and is neutral when combining shapes; -1 means unknown. */
+typedef struct ArrayFacts
+{
+    int dimensions;
+    int element_not_null;
+} ArrayFacts;
+
+static ArrayFacts
+unknown_array(void)
+{
+    ArrayFacts facts = {PD_UNKNOWN, PD_UNKNOWN};
+    return facts;
+}
+
+static ArrayFacts
+merge_array_facts(ArrayFacts a, ArrayFacts b)
+{
+    if (a.dimensions == 0) return b;
+    if (b.dimensions == 0) return a;
+    a.dimensions = a.dimensions == b.dimensions ? a.dimensions : PD_UNKNOWN;
+    a.element_not_null = a.element_not_null == 1 && b.element_not_null == 1
+        ? 1 : PD_UNKNOWN;
+    return a;
+}
+
+/* Only positive IS NOT NULL facts on the expression itself are used. */
+static bool
+predicate_proves_nonnull(Node *expression, Node *predicate)
+{
+    ListCell *lc;
+    if (predicate == NULL) return false;
+    if (IsA(predicate, NullTest))
+    {
+        NullTest *test = (NullTest *) predicate;
+        return test->nulltesttype == IS_NOT_NULL && !test->argisrow &&
+               equal(expression, test->arg);
+    }
+    if (!IsA(predicate, BoolExpr)) return false;
+    if (((BoolExpr *) predicate)->boolop == NOT_EXPR) return false;
+    foreach(lc, ((BoolExpr *) predicate)->args)
+    {
+        bool proven = predicate_proves_nonnull(expression, lfirst(lc));
+        if (((BoolExpr *) predicate)->boolop == AND_EXPR && proven) return true;
+        if (((BoolExpr *) predicate)->boolop == OR_EXPR && !proven) return false;
+    }
+    return ((BoolExpr *) predicate)->boolop == OR_EXPR;
+}
+
+/* Normalize just this CHECK's input to a parameter, so equal() compares parsed
+ * expressions and catalog function identities, never constraint names/text. */
+typedef struct ArrayCheckInput
+{
+    AttrNumber attribute;
+    Oid type;
+} ArrayCheckInput;
+
+static Node *
+normalize_array_check(Node *node, void *context)
+{
+    ArrayCheckInput *input = context;
+    if (node == NULL) return NULL;
+    if ((IsA(node, Var) && ((Var *) node)->varattno == input->attribute &&
+         ((Var *) node)->varno == 1) || IsA(node, CoerceToDomainValue))
+    {
+        Param *parameter = makeNode(Param);
+        parameter->paramkind = PARAM_EXTERN;
+        parameter->paramid = 1;
+        parameter->paramtype = input->type;
+        parameter->paramtypmod = -1;
+        parameter->paramcollid = get_typcollation(input->type);
+        parameter->location = -1;
+        return (Node *) parameter;
+    }
+    return expression_tree_mutator(node, normalize_array_check, context);
+}
+
+static bool
+has_array_constraint(Oid relation, AttrNumber attribute, Oid domain, Oid type)
+{
+    Relation catalog;
+    SysScanDesc scan;
+    ScanKeyData key;
+    HeapTuple tuple;
+    bool found = false;
+    Query *expected;
+    ArrayCheckInput input = {attribute, type};
+    const char *sql = "SELECT CASE WHEN $1 IS NULL THEN TRUE "
+        "WHEN pg_catalog.cardinality($1) = 0 THEN TRUE "
+        "WHEN pg_catalog.array_ndims($1) = 1 "
+        "THEN pg_catalog.array_position($1, NULL) IS NULL ELSE FALSE END";
+    RawStmt *raw = linitial_node(RawStmt, pg_parse_query(sql));
+
+    expected = parse_analyze_fixedparams(raw, sql, &type, 1, NULL);
+    catalog = table_open(ConstraintRelationId, AccessShareLock);
+    ScanKeyInit(&key, OidIsValid(relation) ? Anum_pg_constraint_conrelid :
+                Anum_pg_constraint_contypid, BTEqualStrategyNumber, F_OIDEQ,
+                ObjectIdGetDatum(OidIsValid(relation) ? relation : domain));
+    scan = systable_beginscan(catalog, InvalidOid, false, NULL, 1, &key);
+    while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+    {
+        Form_pg_constraint constraint = (Form_pg_constraint) GETSTRUCT(tuple);
+        bool isnull;
+        Datum bin;
+        Node *expression;
+        if (constraint->contype != CONSTRAINT_CHECK || !constraint->convalidated ||
+            constraint->connoinherit)
+            continue;
+#if PG_VERSION_NUM >= 180000
+        if (!constraint->conenforced) continue;
+#endif
+        bin = heap_getattr(tuple, Anum_pg_constraint_conbin,
+                           RelationGetDescr(catalog), &isnull);
+        if (isnull) continue;
+        expression = stringToNode(TextDatumGetCString(bin));
+        expression = normalize_array_check(expression, &input);
+        if (equal(expression, linitial_node(TargetEntry, expected->targetList)->expr))
+        {
+            found = true;
+            break;
+        }
+    }
+    systable_endscan(scan);
+    table_close(catalog, AccessShareLock);
+    return found;
+}
+
+static bool
+domain_proves_array(Oid type)
+{
+    while (get_typtype(type) == TYPTYPE_DOMAIN)
+    {
+        HeapTuple tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+        Oid base;
+        if (!HeapTupleIsValid(tuple)) return false;
+        base = ((Form_pg_type) GETSTRUCT(tuple))->typbasetype;
+        ReleaseSysCache(tuple);
+        if (has_array_constraint(InvalidOid, 0, type, base)) return true;
+        type = base;
+    }
+    return false;
+}
+
+static ArrayFacts array_facts(Node *node, Query *query, Bitmapset *nullable,
+                             bool grouping_sets);
+
+static ArrayFacts
+array_facts(Node *node, Query *query, Bitmapset *nullable, bool grouping_sets)
+{
+    ArrayFacts facts = unknown_array();
+    ListCell *lc;
+    Oid element;
+    if (node == NULL) return facts;
+    check_stack_depth();
+    element = get_element_type(getBaseType(exprType(node)));
+    if (!OidIsValid(element)) return facts;
+    if (domain_proves_array(exprType(node)))
+    {
+        facts.dimensions = 1;
+        facts.element_not_null = 1;
+        return facts;
+    }
+    switch (nodeTag(node))
+    {
+        case T_Const:
+        {
+            Const *value = (Const *) node;
+            ArrayType *array;
+            if (value->constisnull) { facts.dimensions = 0; return facts; }
+            array = DatumGetArrayTypeP(value->constvalue);
+            facts.dimensions = ARR_NDIM(array);
+            facts.element_not_null = array_contains_nulls(array) ? 0 : 1;
+            return facts;
+        }
+        case T_Var:
+        {
+            Oid relation;
+            AttrNumber attribute;
+            Index varno;
+#if PG_VERSION_NUM >= 180000
+            Node *grouped = grouping_step_expr(query, (Var *) node);
+            if (grouped != NULL)
+                return array_facts(grouped, query, nullable, grouping_sets);
+#endif
+            if (resolve_var_column(query, (Var *) node, &relation, &attribute, &varno) &&
+                has_array_constraint(relation, attribute, InvalidOid, exprType(node)))
+            {
+                facts.dimensions = 1;
+                facts.element_not_null = 1;
+            }
+            return facts;
+        }
+        case T_ArrayExpr:
+        {
+            ArrayExpr *array = (ArrayExpr *) node;
+            facts.dimensions = array->elements == NIL ? 0 : 1;
+            facts.element_not_null = 1;
+            if (array->multidims)
+            {
+                bool first = true;
+                foreach(lc, array->elements)
+                {
+                    ArrayFacts child = array_facts(lfirst(lc), query, nullable, grouping_sets);
+                    facts = first ? child : merge_array_facts(facts, child);
+                    first = false;
+                }
+                if (facts.dimensions > 0) facts.dimensions++;
+                return facts;
+            }
+            foreach(lc, array->elements)
+                if (!expr_is_not_null(lfirst(lc), query, nullable, grouping_sets) &&
+                    !predicate_proves_nonnull(lfirst(lc), query->jointree->quals))
+                    facts.element_not_null = PD_UNKNOWN;
+            return facts;
+        }
+        case T_Aggref:
+        {
+            Aggref *agg = (Aggref *) node;
+            Node *argument;
+            if (!pg_function_named(agg->aggfnoid, "array_agg")) return facts;
+            argument = first_aggregate_argument(agg);
+            if (argument == NULL) return facts;
+            nullable = nullable_for_aggregate(query, (Node *) agg->aggfilter);
+            if (OidIsValid(get_element_type(getBaseType(exprType(argument)))))
+            {
+                facts = array_facts(argument, query, nullable, grouping_sets);
+                if (facts.dimensions > 0) facts.dimensions++;
+                return facts;
+            }
+            facts.dimensions = 1;
+            facts.element_not_null =
+                expr_is_not_null(argument, query, nullable, grouping_sets) ||
+                predicate_proves_nonnull(argument, query->jointree->quals) ||
+                predicate_proves_nonnull(argument, (Node *) agg->aggfilter)
+                ? 1 : PD_UNKNOWN;
+            return facts;
+        }
+        case T_SubLink:
+        {
+            SubLink *link = (SubLink *) node;
+            Query *subquery;
+            Node *argument;
+            Bitmapset *subnullable = NULL;
+            if (link->subLinkType != ARRAY_SUBLINK || !IsA(link->subselect, Query))
+                return facts;
+            subquery = (Query *) link->subselect;
+            argument = (Node *) linitial_node(TargetEntry, subquery->targetList)->expr;
+            find_nullable((Node *) subquery->jointree, &subnullable);
+            if (OidIsValid(get_element_type(getBaseType(exprType(argument)))))
+            {
+                facts = array_facts(argument, subquery, subnullable, subquery->groupingSets != NIL);
+                if (facts.dimensions > 0) facts.dimensions++;
+                return facts;
+            }
+            facts.dimensions = 1;
+            facts.element_not_null =
+                expr_is_not_null(argument, subquery, subnullable, subquery->groupingSets != NIL) ||
+                predicate_proves_nonnull(argument, subquery->jointree->quals) ? 1 : PD_UNKNOWN;
+            return facts;
+        }
+        case T_CoalesceExpr:
+        {
+            bool first = true;
+            foreach(lc, ((CoalesceExpr *) node)->args)
+            {
+                ArrayFacts arm = array_facts(lfirst(lc), query, nullable, grouping_sets);
+                facts = first ? arm : merge_array_facts(facts, arm);
+                first = false;
+            }
+            return facts;
+        }
+        case T_CaseExpr:
+        {
+            CaseExpr *expression = (CaseExpr *) node;
+            facts = array_facts((Node *) expression->defresult, query, nullable, grouping_sets);
+            foreach(lc, expression->args)
+                facts = merge_array_facts(facts, array_facts(
+                    (Node *) lfirst_node(CaseWhen, lc)->result, query, nullable, grouping_sets));
+            return facts;
+        }
+        case T_RelabelType:
+            return array_facts((Node *) ((RelabelType *) node)->arg, query, nullable, grouping_sets);
+        case T_CollateExpr:
+            return array_facts((Node *) ((CollateExpr *) node)->arg, query, nullable, grouping_sets);
+        case T_CoerceToDomain:
+            return array_facts((Node *) ((CoerceToDomain *) node)->arg, query, nullable, grouping_sets);
+        case T_ArrayCoerceExpr:
+        {
+            ArrayCoerceExpr *coercion = (ArrayCoerceExpr *) node;
+            facts = array_facts((Node *) coercion->arg, query, nullable, grouping_sets);
+            /* A no-op/domain relabel cannot introduce NULL elements. Other
+             * conversion functions need their own proven rule. */
+            Node *element_expr = (Node *) coercion->elemexpr;
+            while (IsA(element_expr, CoerceToDomain) || IsA(element_expr, RelabelType))
+                element_expr = IsA(element_expr, CoerceToDomain)
+                    ? (Node *) ((CoerceToDomain *) element_expr)->arg
+                    : (Node *) ((RelabelType *) element_expr)->arg;
+            if (!IsA(element_expr, CaseTestExpr))
+                facts.element_not_null = PD_UNKNOWN;
+            return facts;
+        }
+        default:
+            return facts;
+    }
+}
+
 static const char *
 json_runtime_kind(Oid typid)
 {
@@ -1169,8 +1524,14 @@ sql_array_shape(Node *node, Query *query, Bitmapset *nullable,
     element = new_shape(PD_SHAPE_SCALAR);
     element->runtime_kind = pstrdup(json_runtime_kind(element_type));
     element->type_oid = element_type;
-    /* PostgreSQL arrays are exposed by Bun as T[], without element nulls. */
-    element->result_not_null = 1;
+    ArrayFacts facts = array_facts(node, query, nullable, grouping_sets);
+    int depth;
+
+    if (facts.dimensions == PD_UNKNOWN)
+        return unknown_shape();
+    element->result_not_null = facts.element_not_null;
+    for (depth = 1; depth < facts.dimensions; depth++)
+        element = array_shape_from_element(element, 1);
     shape = array_shape_from_element(element,
         expr_is_not_null(node, query, nullable, grouping_sets) ? 1 : 0);
     return shape;
@@ -1766,6 +2127,7 @@ describe_columns(ReturnSetInfo *rsinfo, Query *query, List *tlist)
         int          base_not_null = PD_UNKNOWN;
         int          result_not_null = PD_UNKNOWN;
         Jsonb       *result_shape;
+        ArrayFacts   facts;
 
         /*
          * resjunk entries are in the list but not the result: an ORDER BY sort
@@ -1811,10 +2173,11 @@ describe_columns(ReturnSetInfo *rsinfo, Query *query, List *tlist)
         result_shape = json_shape_for_expression((Node *) tle->expr, query,
                                                  nullable, grouping_sets);
 
+        facts = array_facts((Node *) tle->expr, query, nullable, grouping_sets);
         emit_row(rsinfo, "column", ord, tle->resname,
                  exprType((Node *) tle->expr),
                  source_table, source_column, base_not_null, result_not_null,
-                 result_shape);
+                 result_shape, facts.dimensions, facts.element_not_null);
     }
 }
 
@@ -1883,7 +2246,7 @@ pg_describe(PG_FUNCTION_ARGS)
     /* Parameters, in $1..$n order. */
     for (i = 0; i < num_params; i++)
         emit_row(rsinfo, "param", i + 1, NULL, param_types[i],
-                 InvalidOid, NULL, PD_UNKNOWN, PD_UNKNOWN, NULL);
+                 InvalidOid, NULL, PD_UNKNOWN, PD_UNKNOWN, NULL, PD_UNKNOWN, PD_UNKNOWN);
 
     /*
      *   SELECT               -> targetList

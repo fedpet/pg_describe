@@ -67,8 +67,8 @@ export interface TypeMapResult {
  * Map a PostgreSQL type name to a TypeScript type.
  *
  * Arrays are handled by recursion: `integer[]` becomes `number[]`, and
- * `text[][]` becomes `string[][]`, because format_type_be prints one `[]` per
- * dimension.
+ * `text[][]` becomes `string[][]` for explicit overrides. PostgreSQL display
+ * names do not preserve rank; result columns must use array_dimensions.
  */
 export function tsTypeFor(
   pgType: string,
