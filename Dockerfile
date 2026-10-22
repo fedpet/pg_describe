@@ -15,7 +15,7 @@
 # If you want a slimmer image for production, drop the build-essential and
 # postgresql-server-dev-$PG_MAJOR packages in a second stage and copy across just
 # $(pg_config --pkglibdir)/pg_describe.so and $(pg_config --sharedir)/extension/.
-ARG PG_MAJOR=17
+ARG PG_MAJOR=18
 FROM postgres:${PG_MAJOR}-bookworm
 ARG PG_MAJOR
 

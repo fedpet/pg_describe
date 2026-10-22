@@ -173,8 +173,8 @@ QUERY:  SELECT FROM WHERE
 
 ## Errors abort the transaction
 
-Analysis errors are not caught. `pg-describe-gen` therefore describes each query
-independently and collects failures rather than stopping at the first.
+Analysis errors are not caught. Consumers should describe each query in its own
+transaction and collect failures independently.
 
 Catching them in the extension needs `BeginInternalSubTransaction` with the
 matching `RollbackAndReleaseCurrentSubTransaction` and saved

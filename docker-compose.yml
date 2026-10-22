@@ -3,9 +3,8 @@ services:
     build:
       context: .
       args:
-        PG_MAJOR: ${PG_MAJOR:-17}
-    image: pg_describe:${PG_MAJOR:-17}
-    container_name: pg-describe
+        PG_MAJOR: ${PG_MAJOR:-18}
+    image: pg_describe:${PG_MAJOR:-18}
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_USER: postgres

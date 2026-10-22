@@ -17,9 +17,7 @@ RETURNS TABLE (kind            text,
                source_column   text,
                base_not_null   boolean,
                result_not_null boolean,
-               result_shape    jsonb,
-               array_dimensions integer,
-               array_element_not_null boolean)
+               result_shape    jsonb)
 AS 'MODULE_PATHNAME', 'pg_describe'
 LANGUAGE C VOLATILE STRICT;
 

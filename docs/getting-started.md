@@ -7,7 +7,7 @@ sidebar_label: Getting started
 ## A database with the extension, in one command
 
 ```bash
-git clone https://github.com/sajonaro/pg_describe
+git clone https://github.com/fedpet/pg_describe
 cd pg_describe
 docker compose up -d          # PGPORT=5433 docker compose up -d  if 5432 is taken
 ```
@@ -20,7 +20,7 @@ psql -h localhost -U postgres -d pg_describe_demo \
      -c "SELECT * FROM pg_describe('SELECT 1 AS n')"
 ```
 
-Other ways to install — PGXN, building from source, version requirements — are
+Building from source and version requirements are
 in [Installation](installation.md).
 
 ## Calling the function
@@ -100,25 +100,4 @@ QUERY:  SELECT id, emial FROM users
 
 Errors abort the surrounding transaction, so a tool describing many queries
 should send each in its own round trip and collect the failures rather than
-stopping at the first. That is what `pg-describe-gen` does.
-
-## Generating TypeScript
-
-```bash
-npm install --save-dev pg-describe-gen
-```
-
-```json
-// pg-describe.json
-{
-  "queries": "queries",
-  "output": "src/generated/queries.ts"
-}
-```
-
-```bash
-npx pg-describe-gen
-```
-
-The [end-to-end example](end-to-end-example.md) walks the whole loop — schema,
-queries, generated types, and a build that fails when the schema drifts.
+stopping at the first.

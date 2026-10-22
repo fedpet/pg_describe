@@ -123,21 +123,8 @@ question of the same expression, so the answer does not depend on which server
 you ask. Under `GROUP BY ROLLUP` it stays unknown, because a super-aggregate
 row nulls the grouped column whatever produced it.
 
-## In generated TypeScript
+## Consuming the metadata
 
-`pg-describe-gen` follows the same rule: `result_not_null = t` becomes `T`,
-anything else becomes `T | null`.
-
-```typescript
-export interface ListRecentOrdersRow {
-  id: string            // orders.id       — NOT NULL, and not outer-joined
-  email: string | null  // customers.email — NOT NULL, but LEFT JOINed
-}
-```
-
-Over-declaring a null costs one impossible check. Under-declaring one costs a
-crash. When the analysis is uncertain, it picks the cheap mistake.
-
-Parameters are the exception: they are declared non-null. Passing `null` is
-legal SQL, but it is almost always a bug rather than an intent, and `| null` on
-every parameter makes the generated types tiresome to use.
+Only `result_not_null = true` proves that a result cannot be NULL. Treat both
+false and unknown as nullable when generating types. Parameter rows do not prove
+that a parameter is non-null; consumers choose their own parameter policy.

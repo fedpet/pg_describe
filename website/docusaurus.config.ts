@@ -2,7 +2,7 @@ import type * as Preset from '@docusaurus/preset-classic'
 import type { Config } from '@docusaurus/types'
 import { themes as prismThemes } from 'prism-react-renderer'
 
-const organization = 'sajonaro'
+const organization = 'fedpet'
 const project = 'pg_describe'
 const repo = `https://github.com/${organization}/${project}`
 
@@ -70,19 +70,9 @@ const config: Config = {
           label: 'Documentation',
         },
         {
-          to: '/end-to-end-example',
-          label: 'Example',
+          to: '/getting-started',
+          label: 'Get started',
           position: 'left',
-        },
-        {
-          href: 'https://pgxn.org/dist/pg_describe/',
-          label: 'PGXN',
-          position: 'right',
-        },
-        {
-          href: 'https://www.npmjs.com/package/pg-describe-gen',
-          label: 'npm',
-          position: 'right',
         },
         {
           href: repo,
@@ -99,7 +89,6 @@ const config: Config = {
           items: [
             { label: 'Overview', to: '/' },
             { label: 'Getting started', to: '/getting-started' },
-            { label: 'End-to-end example', to: '/end-to-end-example' },
             { label: 'Function reference', to: '/function-reference' },
           ],
         },
