@@ -14,26 +14,9 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
-      label: 'TypeScript',
-      collapsed: false,
-      items: [
-        'end-to-end-example',
-        'queries-in-sql-files',
-        'generated-code',
-        'cli-configuration',
-      ],
-    },
-    {
-      type: 'category',
-      label: 'Typing',
-      collapsed: false,
-      items: ['nullability', 'type-mapping'],
-    },
-    {
-      type: 'category',
       label: 'Reference',
       collapsed: false,
-      items: ['function-reference', 'permissions', 'how-it-works'],
+      items: ['function-reference', 'nullability', 'permissions', 'how-it-works'],
     },
     {
       type: 'category',

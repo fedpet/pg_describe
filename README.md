@@ -1,170 +1,68 @@
 # pg_describe
 
-[![CI](https://github.com/sajonaro/pg_describe/actions/workflows/ci.yml/badge.svg)](https://github.com/sajonaro/pg_describe/actions/workflows/ci.yml)
-[![PGXN](https://img.shields.io/badge/PGXN-pg__describe-blue)](https://pgxn.org/dist/pg_describe/)
-[![npm](https://img.shields.io/npm/v/pg-describe-gen)](https://www.npmjs.com/package/pg-describe-gen)
-[![PostgreSQL 17](https://img.shields.io/badge/PostgreSQL-17-336791)](https://www.postgresql.org/)
+[![CI](https://github.com/fedpet/pg_describe/actions/workflows/ci.yml/badge.svg)](https://github.com/fedpet/pg_describe/actions/workflows/ci.yml)
+[![PostgreSQL 18](https://img.shields.io/badge/PostgreSQL-18-336791)](https://www.postgresql.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 **pg_describe reports what a query would return, without running it.**
 
+An independently maintained fork of
+[sajonaro/pg_describe](https://github.com/sajonaro/pg_describe), focused on
+language-neutral query metadata for code generators and developer tools.
+Supported and tested on PostgreSQL 18.
+
 ```sql
-SELECT * FROM pg_describe('SELECT id, email FROM users WHERE id = $1');
-```
-```
-  kind  | ord | name  | type_name | source_table | base_not_null | result_not_null
---------+-----+-------+-----------+--------------+---------------+-----------------
- param  |   1 |       | integer   |              |               |
- column |   1 | id    | integer   | users        | t             | t
- column |   2 | email | text      | users        | t             | t
+SELECT ord, name, type_name, result_not_null
+FROM pg_describe('SELECT id, email FROM users WHERE id = $1');
 ```
 
-## Features
+The extension uses PostgreSQL's parser and analyser. It reports parameter and
+result types, source-column provenance, outer-join-aware nullability, recursive
+JSON shapes, and provable SQL array rank and element nullability. Rewrite,
+planning and execution are never reached. Access privileges are checked before
+metadata is returned.
 
-- **Nothing is executed** — parse and analysis only, so describing
-  `DELETE FROM orders WHERE id = $1` is safe.
-- **Parameter types are inferred**; the query text never declares one.
-- **Result columns as the wire protocol sees them** — name, type OID and SQL
-  type name, with `ORDER BY`-only columns excluded.
-- **Outer-join-aware nullability**: a column on the nullable side of a
-  `LEFT JOIN` is reported nullable even when it is declared `NOT NULL`. Tools
-  that read `attnotnull` alone get this wrong.
-- **Column provenance** — the source table and column behind each result field.
-- **One round trip.** It is an ordinary `SELECT`, callable from any client in
-  any language, with no wire-protocol code to write.
-- **Privileges are enforced**, so it cannot be used to read a schema the caller
-  has no rights to.
-- **TypeScript code generation** from plain `.sql` files, included.
-
-## Documentation
-
-Full documentation: **https://sajonaro.github.io/pg_describe/**
-
-## Getting started
+## Get started
 
 ```bash
-git clone https://github.com/sajonaro/pg_describe
+git clone https://github.com/fedpet/pg_describe
 cd pg_describe
-docker compose up -d          # PGPORT=5433 docker compose up -d  if 5432 is taken
+docker compose up -d --build  # PGPORT=5433 if 5432 is taken
 
 psql -h localhost -U postgres -d pg_describe_demo \
-     -c "SELECT * FROM pg_describe('SELECT 1 AS n')"
+  -c "SELECT * FROM pg_describe('SELECT 1 AS n')"
 ```
 
-Or install it into a database you already have:
+To build against an existing PostgreSQL installation:
 
 ```bash
-pgxn install pg_describe
+make
+sudo make install
 ```
+
 ```sql
 CREATE EXTENSION pg_describe;
 ```
 
-Needs PostgreSQL 17 (16 will probably work, untested) and the ability to install
-extensions — see [Installation](docs/installation.md). For TypeScript types:
+See [Installation](docs/installation.md) for requirements and upgrades.
 
-```bash
-npm install --save-dev pg-describe-gen
-```
+## Documentation
 
-## Example
+- [Overview](docs/overview.md)
+- [Getting started](docs/getting-started.md)
+- [Function reference](docs/function-reference.md)
+- [Nullability](docs/nullability.md)
+- [Permissions](docs/permissions.md)
+- [How it works](docs/how-it-works.md)
+- [Contributing and releases](docs/contributing.md)
+- [Changelog](CHANGELOG.md)
 
-Write plain SQL. Native `$1`, no dialect, so the file runs in `psql` as it is:
+The extension is callable from any PostgreSQL client. Consumers own their code
+generation and language-specific type mapping.
 
-```sql
--- queries/orders.sql
--- @name ListRecentOrders
--- Orders with their customer, if any.
-SELECT o.id, o.total, c.email
-FROM orders o
-LEFT JOIN customers c ON c.id = o.customer_id
-WHERE o.placed_at >= $1;
-```
+## Credit and license
 
-```bash
-npx pg-describe-gen
-```
-
-Get types the database itself vouches for:
-
-```typescript
-export interface ListRecentOrdersParams {
-  p1: Date
-}
-
-export interface ListRecentOrdersRow {
-  id: string            // orders.id       — bigint arrives as a string
-  total: string         // orders.total    — numeric arrives as a string
-  email: string | null  // customers.email — NOT NULL, but LEFT JOINed
-}
-
-/**
- * Orders with their customer, if any.
- */
-export async function listRecentOrders(
-  client: ClientBase,
-  params: ListRecentOrdersParams,
-): Promise<ListRecentOrdersRow[]>
-```
-
-`email` is nullable because the join can null-extend it, not because the schema
-says so — that is the difference. Add `pg-describe-gen --check` to CI and a
-migration that changes what a query returns fails the pull request instead of
-the deploy.
-
-The [end-to-end example](docs/end-to-end-example.md) walks the whole loop, and
-[`examples/typescript`](examples/typescript) is it, runnable.
-
-## Resources
-
-- [Getting started](docs/getting-started.md) — a database with the extension in one command
-- [End-to-end example](docs/end-to-end-example.md) — schema to failing build
-- [Queries in SQL files](docs/queries-in-sql-files.md) — how query files are written
-- [CLI usage and configuration](docs/cli-configuration.md) — `pg-describe-gen`
-- [Nullability](docs/nullability.md) — what `result_not_null` means and where it stops
-- [Function reference](docs/function-reference.md) — the full signature and semantics
-- [Permissions](docs/permissions.md) — why the function checks privileges itself
-- [How it works](docs/how-it-works.md) — the parser, the join tree walk, the internals
-
-## Repository
-
-```
-src/pg_describe.c        the extension
-test/                    pg_regress suite, 29 assertions
-packages/codegen/        pg-describe-gen, published to npm
-examples/typescript/     runnable example, generated output committed
-docs/                    documentation source
-website/                 Docusaurus site that renders docs/
-```
-
-`packages/*` and `examples/*` are npm workspaces: `npm install` at the root
-wires the example to the local generator. See [Contributing](docs/contributing.md)
-for the test and docs workflows.
-
-## Project state
-
-The extension and the generator are complete and tested on every commit, but
-this is young. The API of `pg_describe(text)` is what the TypeScript generator
-depends on and is not expected to change; the generator's config file may
-still gain keys. Issues and pull requests are welcome.
-
-## Credit
-
-The idea is taken from [pgTyped](https://github.com/adelsz/pgtyped) by
-[Adel Salakh](https://github.com/adelsz), which demonstrated that TypeScript
-types for SQL can come from a live database rather than a hand-maintained model
-of it. [`sqlc`](https://sqlc.dev) and [`sqlx`](https://github.com/launchbadge/sqlx)
-do the same for Go and Rust.
-
-pgTyped asks the server the same question over the wire protocol, from the
-client, and needs no extension — which is what you want on RDS, Cloud SQL and
-most managed Postgres, where `pg_describe` cannot be installed at all. It is
-mature, actively maintained and has a larger feature surface than this project.
-`pg_describe` moves the question into the server for the cases where you can
-install an extension: one `SELECT` instead of a wire-protocol implementation per
-language, and nullability that accounts for outer joins. See
-[Credit](docs/credit.md).
-
-## License
-
-MIT © 2026-present, see [LICENSE](LICENSE).
+Originally created by [sajonaro](https://github.com/sajonaro/pg_describe).
+Inspired by [pgTyped](https://github.com/adelsz/pgtyped),
+[sqlc](https://sqlc.dev), and [sqlx](https://github.com/launchbadge/sqlx).
+See [Credit](docs/credit.md) and [LICENSE](LICENSE).

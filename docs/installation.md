@@ -6,73 +6,72 @@ sidebar_label: Installation
 
 ## Requirements
 
-**PostgreSQL 17.** That is what CI builds and tests on every commit. The code
-depends on `Query->rteperminfos`, which is PostgreSQL 16+, so 16 will probably
-work — but "probably" is not "tested", so it is not claimed.
+Supported and tested on **PostgreSQL 18**. Building requires a C compiler,
+PostgreSQL server headers and PGXS. The extension must be compiled against the
+server major version where it will run.
 
-You need to be able to install extensions in the target database. On RDS, Cloud
-SQL and most managed Postgres you cannot; see [Credit](credit.md) for the tool
-that works there.
+You need permission to install extensions in the target database. Check your
+provider's extension policy when using a managed database.
 
 ## Docker
 
-The fastest way to get a server with the extension already loaded:
-
 ```bash
-git clone https://github.com/sajonaro/pg_describe
+git clone https://github.com/fedpet/pg_describe
 cd pg_describe
-docker compose up -d          # PGPORT=5433 docker compose up -d  if 5432 is taken
+docker compose up -d --build  # PGPORT=5433 if 5432 is taken
 ```
 
-The image builds the extension and runs `CREATE EXTENSION` in the demo database
-and in `template1`, so databases created later inherit it.
-
-## PGXN
-
-```bash
-pgxn install pg_describe
-```
-
-Then, in each database that needs it:
-
-```sql
-CREATE EXTENSION pg_describe;
-```
+The image builds the extension and creates it in the demo database and in
+`template1`, so databases created later inherit it. The image is a development
+server with regression-test tooling; it is not a prebuilt production artifact.
 
 ## From source
 
-Building needs the PostgreSQL server headers and a C compiler:
+Download a versioned source archive from
+[GitHub releases](https://github.com/fedpet/pg_describe/releases), or check out
+its tag. The source tree can also be built directly during development.
+
+Install the server headers:
 
 | Distribution | Package |
 |---|---|
-| Debian / Ubuntu | `postgresql-server-dev-17` |
-| RHEL / Fedora | `postgresql17-devel` |
+| Debian / Ubuntu | `postgresql-server-dev-18` |
+| RHEL / Fedora | `postgresql18-devel` |
 
-The `Makefile` is standard PGXS, so it builds against whatever `pg_config` is on
-your `PATH`:
+The Makefile uses the `pg_config` on your PATH. To select a specific installation:
 
 ```bash
-make
-sudo make install
+make PG_CONFIG=/path/to/pg_config
+sudo make PG_CONFIG=/path/to/pg_config install
 ```
+
+In each database that needs it:
 
 ```sql
 CREATE EXTENSION pg_describe;
 ```
 
-To run the regression suite against a server you control:
+It can also be installed in a dedicated schema:
 
-```bash
-PGUSER=postgres PGDATABASE=contrib_regression make installcheck
+```sql
+CREATE SCHEMA extensions;
+CREATE EXTENSION pg_describe SCHEMA extensions;
 ```
 
-## The TypeScript generator
+## Upgrading
 
-`pg-describe-gen` is published separately on npm and needs Node 18+ and a
-database with the extension installed:
+Install the new extension files, then reconnect before updating each database:
 
-```bash
-npm install --save-dev pg-describe-gen
+```sql
+ALTER EXTENSION pg_describe UPDATE TO '2.0.0';
 ```
 
-See [CLI usage and configuration](cli-configuration.md).
+Version 2 supports upgrades from 1.0.0 and 1.1.0. Its return type adds metadata,
+so the update recreates `pg_describe(text)`. Views or other database objects that
+depend on the old function must be migrated explicitly; the script does not use
+`CASCADE`. Custom function comments and execution grants must be reapplied.
+Perform the update and any permission changes in one transaction if access to
+the function is restricted.
+
+Long-lived sessions can retain a previously loaded shared library. Recycle those
+connections after replacing the extension files.

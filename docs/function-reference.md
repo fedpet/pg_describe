@@ -14,7 +14,10 @@ pg_describe(sql text) RETURNS TABLE (
   source_table    regclass,  -- NULL unless the column is a plain column reference
   source_column   text,
   base_not_null   boolean,   -- attnotnull on the source column
-  result_not_null boolean    -- can this result column be NULL. Use this one.
+  result_not_null boolean,   -- can this result column be NULL. Use this one.
+  result_shape    jsonb,     -- recursive shape for constructed JSON/JSONB
+  array_dimensions integer, -- provable SQL array rank; NULL if unknown
+  array_element_not_null boolean -- provable element nullability; NULL if unknown
 )
 ```
 
@@ -33,6 +36,40 @@ One row per parameter, then one row per result column.
 
 Parameter rows carry only `type_oid` and `type_name`; the remaining columns are
 NULL.
+
+## JSON result shapes
+
+`result_shape` is NULL for non-JSON columns. For JSON and JSONB it has four
+recursive variants: `unknown`, `scalar`, `array`, and `object`. Scalar leaves
+retain the PostgreSQL type, provenance, base nullability, and result
+nullability. Arrays carry their element shape. Objects carry ordered named
+fields, optionality, and an `additional` value shape for dynamic keys.
+
+Stored JSON columns, parameters, path/query functions, and other values whose
+contents cannot be known without executing the statement report `unknown`.
+JSON produced by PostgreSQL's constructors is described recursively, including
+SQL arrays and composite values embedded in it.
+
+## SQL array facts
+
+`array_dimensions` and `array_element_not_null` describe SQL arrays. NULL means
+unknown; rank zero is the empty array. PostgreSQL's type OID and SQL type spelling
+do not encode rank, and a column declared `integer[][]` can store flat or nested
+values. Constructors, constant arrays, `ARRAY(SELECT)`, `array_agg`, and compatible
+CASE/COALESCE arms carry provable facts.
+
+A validated, enforced table or domain CHECK in this canonical form proves a flat
+array without NULL elements; the whole value can still be NULL:
+
+```sql
+CHECK (CASE WHEN value IS NULL THEN TRUE
+  WHEN cardinality(value) = 0 THEN TRUE
+  WHEN array_ndims(value) = 1 THEN array_position(value, NULL) IS NULL
+  ELSE FALSE END)
+```
+
+Use the column name for `value` in table constraints, or `VALUE` in domain
+constraints. Unknown-rank SQL arrays converted to JSON have an unknown shape.
 
 ## Which columns are described
 
@@ -53,7 +90,8 @@ is a plain column reference: a `Var` with `varlevelsup = 0` and `varattno > 0`.
 
 Everything else — expressions, function calls, literals, whole-row references,
 system columns, correlated references to an enclosing query — gets a name and a
-type but no provenance, and both nullability flags come back NULL.
+type but no provenance, and base nullability comes back NULL. Result nullability is inferred separately
+for recognized expressions; see [Nullability](nullability.md).
 
 **NULL means unknown, not "not null".** Treat it as nullable. See
 [Nullability](nullability.md).

@@ -1,8 +1,10 @@
 services:
   db:
-    build: .
-    image: pg_describe:17
-    container_name: pg-describe
+    build:
+      context: .
+      args:
+        PG_MAJOR: ${PG_MAJOR:-18}
+    image: pg_describe:${PG_MAJOR:-18}
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_USER: postgres
@@ -11,7 +13,7 @@ services:
       # Override the host port if 5432 is taken:  PGPORT=5433 docker compose up
       - "${PGPORT:-5432}:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d pg_describe_demo"]
       interval: 2s

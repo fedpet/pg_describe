@@ -1,4 +1,0 @@
-{
-  "queries": "queries",
-  "output": "src/generated/queries.ts"
-}

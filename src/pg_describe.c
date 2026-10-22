@@ -25,9 +25,19 @@
 #include "funcapi.h"
 
 #include "access/htup_details.h"
+#include "access/genam.h"
+#include "access/table.h"
+#include "catalog/pg_constraint.h"
+#include "catalog/pg_type.h"
+#include "nodes/makefuncs.h"
+#include "nodes/readfuncs.h"
+#include "utils/fmgroids.h"
+#include "utils/rel.h"
 #include "access/sysattr.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_attribute.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_type_d.h"
 #include "miscadmin.h"
 #include "nodes/bitmapset.h"
 #include "nodes/nodeFuncs.h"
@@ -36,13 +46,17 @@
 #include "parser/parsetree.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/json.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
 
 PG_MODULE_MAGIC;
 
-/* The nine columns declared by RETURNS TABLE, in order. */
+/* The columns declared by RETURNS TABLE, in order. */
 #define PD_COL_KIND             0
 #define PD_COL_ORD              1
 #define PD_COL_NAME             2
@@ -52,7 +66,10 @@ PG_MODULE_MAGIC;
 #define PD_COL_SOURCE_COLUMN    6
 #define PD_COL_BASE_NOT_NULL    7
 #define PD_COL_RESULT_NOT_NULL  8
-#define PD_NCOLS                9
+#define PD_COL_RESULT_SHAPE     9
+#define PD_COL_ARRAY_DIMENSIONS 10
+#define PD_COL_ELEMENT_NOT_NULL 11
+#define PD_NCOLS                12
 
 /*
  * Nullability flags are tri-state: true, false, unknown. An expression column
@@ -74,7 +91,8 @@ emit_row(ReturnSetInfo *rsinfo,
          Oid source_table,
          const char *source_column,
          int base_not_null,
-         int result_not_null)
+         int result_not_null,
+         Jsonb *result_shape, int array_dimensions, int element_not_null)
 {
     Datum values[PD_NCOLS];
     bool  nulls[PD_NCOLS];
@@ -134,6 +152,22 @@ emit_row(ReturnSetInfo *rsinfo,
         nulls[PD_COL_RESULT_NOT_NULL] = false;
     }
 
+    if (result_shape != NULL)
+    {
+        values[PD_COL_RESULT_SHAPE] = JsonbPGetDatum(result_shape);
+        nulls[PD_COL_RESULT_SHAPE] = false;
+    }
+
+    if (array_dimensions != PD_UNKNOWN)
+    {
+        values[PD_COL_ARRAY_DIMENSIONS] = Int32GetDatum(array_dimensions);
+        nulls[PD_COL_ARRAY_DIMENSIONS] = false;
+    }
+    if (element_not_null != PD_UNKNOWN)
+    {
+        values[PD_COL_ELEMENT_NOT_NULL] = BoolGetDatum(element_not_null != 0);
+        nulls[PD_COL_ELEMENT_NOT_NULL] = false;
+    }
     tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 
@@ -326,6 +360,1741 @@ check_permissions(Query *query)
 }
 
 /* ------------------------------------------------------------------------
+ * Nullability of an expression
+ * --------------------------------------------------------------------- */
+
+#if PG_VERSION_NUM >= 180000
+
+/*
+ * The expression a Var into the grouping step stands for, or NULL if the Var
+ * does not point at one.
+ *
+ * From v18 the parser interposes an RTE_GROUP between the target list and the
+ * range table whenever a query groups. A grouped column in the target list is
+ * then a Var into that RTE rather than into the relation it came from, and
+ * rte->groupexprs holds the expression each one stands for. Everything that
+ * wants to know what a grouped column really is goes through here, so that
+ * provenance and nullability cannot disagree about it.
+ */
+static Node *
+grouping_step_expr(Query *query, Var *var)
+{
+    RangeTblEntry *rte;
+
+    if (var->varlevelsup != 0 || var->varattno <= 0)
+        return NULL;
+
+    rte = rt_fetch(var->varno, query->rtable);
+
+    if (rte->rtekind != RTE_GROUP ||
+        var->varattno > list_length(rte->groupexprs))
+        return NULL;
+
+    return (Node *) list_nth(rte->groupexprs, var->varattno - 1);
+}
+#endif
+
+/*
+ * Resolve a target-list Var to the relation column it came from.
+ *
+ * Returns false when there is none to name: a correlated reference, a whole-row
+ * or system column, or a Var into anything that is not a plain relation.
+ */
+static bool
+resolve_var_column(Query *query, Var *var, Oid *relid, AttrNumber *attno,
+                   Index *varno)
+{
+    RangeTblEntry *rte;
+
+#if PG_VERSION_NUM >= 180000
+
+    /*
+     * Resolve through the grouping step, which is what lets a grouped column
+     * keep the provenance and the attnotnull it reported before v18.
+     *
+     * A loop rather than one step: nothing promises the expression behind a
+     * grouping entry is not itself a Var needing the same treatment. Anything
+     * that is not a Var ends the walk without provenance -- the right answer
+     * for GROUP BY upper(email), whose output has no source column to name.
+     * Its nullability is a separate question, and expr_is_not_null answers it
+     * by recursing into that same expression.
+     */
+    for (;;)
+    {
+        Node *gexpr = grouping_step_expr(query, var);
+
+        if (gexpr == NULL)
+            break;
+        if (!IsA(gexpr, Var))
+            return false;
+
+        var = (Var *) gexpr;
+    }
+#endif
+
+    /*
+     * varlevelsup > 0 refers to an enclosing query's range table, so rt_fetch
+     * here would read the wrong entry. varattno <= 0 is a whole-row reference
+     * or a system column, with no pg_attribute row to consult.
+     */
+    if (var->varlevelsup != 0 || var->varattno <= 0)
+        return false;
+
+    rte = rt_fetch(var->varno, query->rtable);
+
+    if (rte->rtekind != RTE_RELATION)
+        return false;
+
+    *relid = rte->relid;
+    *attno = var->varattno;
+    *varno = var->varno;
+    return true;
+}
+
+/* Does this column's relation declare it NOT NULL? */
+static bool
+column_is_not_null(Oid relid, AttrNumber attno)
+{
+    HeapTuple atup;
+    bool      notnull;
+
+    /*
+     * Syscache rather than a query against pg_attribute: a hash lookup over a
+     * relation analysis has already locked.
+     */
+    atup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid), Int16GetDatum(attno));
+    if (!HeapTupleIsValid(atup))
+        return false;
+
+    notnull = ((Form_pg_attribute) GETSTRUCT(atup))->attnotnull;
+    ReleaseSysCache(atup);
+    return notnull;
+}
+
+/*
+ * count() is the one aggregate that never returns NULL: over no rows at all it
+ * returns 0, where every other aggregate returns NULL. Matched by name in
+ * pg_catalog rather than by a hardcoded OID, so that a user-defined "count"
+ * in another schema is not mistaken for it.
+ */
+static bool
+is_count_aggregate(Oid aggfnoid)
+{
+    char *name = get_func_name(aggfnoid);
+    bool  result;
+
+    if (name == NULL)
+        return false;
+
+    result = (strcmp(name, "count") == 0 &&
+              get_func_namespace(aggfnoid) == PG_CATALOG_NAMESPACE);
+    pfree(name);
+    return result;
+}
+
+/* STRICT is only the implication NULL input -> NULL output. */
+static bool
+known_nonnull_function(Oid function)
+{
+    static const char *const names[] = {
+        "upper", "lower", "length", "char_length", "btrim", "ltrim", "rtrim",
+        "date_trunc", "textcat", "int2", "int4", "int8", "float4", "float8",
+        "numeric", "text", "varchar", "date", "timestamp", "timestamptz",
+        "int2eq", "int2ne", "int2lt", "int2le", "int2gt", "int2ge",
+        "int4eq", "int4ne", "int4lt", "int4le", "int4gt", "int4ge",
+        "int8eq", "int8ne", "int8lt", "int8le", "int8gt", "int8ge",
+        "texteq", "textne", "text_lt", "text_le", "text_gt", "text_ge",
+        "uuid_eq", "uuid_ne", "uuid_lt", "uuid_le", "uuid_gt", "uuid_ge",
+        "int4pl", "int4mi", "int4mul", "int4div", "int8pl", "int8mi",
+        "booland_statefunc", "boolor_statefunc", "booleq", "boolne"
+    };
+    char *name;
+    int i;
+
+    if (get_func_namespace(function) != PG_CATALOG_NAMESPACE)
+        return false;
+    name = get_func_name(function);
+    for (i = 0; i < lengthof(names); i++)
+        if (name != NULL && strcmp(name, names[i]) == 0)
+            return true;
+    return false;
+}
+
+static bool expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
+                             bool grouping_sets);
+
+/* Are every one of these expressions provably non-null? */
+static bool
+args_are_not_null(List *args, Query *query, Bitmapset *nullable,
+                  bool grouping_sets)
+{
+    ListCell *lc;
+
+    /*
+     * Vacuous truth would be wrong here. Strictness says a function returns
+     * NULL when an argument is NULL; with no arguments it says nothing at all
+     * about the result, so a zero-argument function is never proven non-null
+     * this way.
+     */
+    if (args == NIL)
+        return false;
+
+    foreach(lc, args)
+    {
+        if (!expr_is_not_null((Node *) lfirst(lc), query, nullable, grouping_sets))
+            return false;
+    }
+    return true;
+}
+
+/*
+ * Can this expression be proven never to evaluate to NULL?
+ *
+ * False means "not proven", never "can be NULL" -- so every node kind that is
+ * not understood falls through to the default and is reported unknown. That is
+ * the direction that matters: over-declaring a null costs one impossible check
+ * in the caller, under-declaring one costs a crash.
+ *
+ * The reasoning is the planner's own, not a heuristic. Strictness is recorded
+ * per function in pg_proc, and everything else here is a property of the node
+ * type rather than a guess about it.
+ */
+static bool
+expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
+                 bool grouping_sets)
+{
+    if (node == NULL)
+        return false;
+
+    /* Expressions nest arbitrarily deeply; this is the standard guard. */
+    check_stack_depth();
+
+    switch (nodeTag(node))
+    {
+        case T_Const:
+            return !((Const *) node)->constisnull;
+
+        case T_Var:
+        {
+            Oid         relid;
+            AttrNumber  attno;
+            Index       varno;
+
+#if PG_VERSION_NUM >= 180000
+
+            /*
+             * A Var into the grouping step stands for the expression grouped
+             * by, so that expression is what has to be proven. Without this,
+             * GROUP BY date_trunc('day', ts) over a NOT NULL column answers
+             * differently on v18 than on v17, where the target list holds the
+             * expression directly and this case is never reached.
+             *
+             * Not under grouping sets: a super-aggregate row nulls the grouped
+             * column however non-null the expression behind it, which is the
+             * same reason the plain column below is not proven there either.
+             */
+            if (!grouping_sets)
+            {
+                Node *gexpr = grouping_step_expr(query, (Var *) node);
+
+                if (gexpr != NULL)
+                    return expr_is_not_null(gexpr, query, nullable,
+                                            grouping_sets);
+            }
+#endif
+
+            if (!resolve_var_column(query, (Var *) node, &relid, &attno, &varno))
+                return false;
+
+            /*
+             * Non-null in the result only if non-null at the source and nothing
+             * downstream can null-extend it.
+             */
+            return column_is_not_null(relid, attno) &&
+                   !bms_is_member(varno, nullable) &&
+                   !grouping_sets;
+        }
+
+        /* NULL only when every argument is NULL, so one non-null suffices. */
+        case T_CoalesceExpr:
+        {
+            ListCell *lc;
+
+            foreach(lc, ((CoalesceExpr *) node)->args)
+            {
+                if (expr_is_not_null((Node *) lfirst(lc), query, nullable,
+                                     grouping_sets))
+                    return true;
+            }
+            return false;
+        }
+
+        /*
+         * Every arm must be non-null, the ELSE included. A CASE with no ELSE
+         * yields NULL when nothing matches, so its absence settles it.
+         */
+        case T_CaseExpr:
+        {
+            CaseExpr *caseexpr = (CaseExpr *) node;
+            ListCell *lc;
+
+            if (!expr_is_not_null((Node *) caseexpr->defresult, query, nullable,
+                                  grouping_sets))
+                return false;
+
+            foreach(lc, caseexpr->args)
+            {
+                CaseWhen *when = lfirst_node(CaseWhen, lc);
+
+                if (!expr_is_not_null((Node *) when->result, query, nullable,
+                                      grouping_sets))
+                    return false;
+            }
+            return true;
+        }
+
+        /* Prove both implications, not just the STRICT input rule. */
+        case T_FuncExpr:
+        {
+            FuncExpr *func = (FuncExpr *) node;
+
+            return known_nonnull_function(func->funcid) && func_strict(func->funcid) &&
+                   args_are_not_null(func->args, query, nullable, grouping_sets);
+        }
+
+        case T_OpExpr:
+        {
+            OpExpr *op = (OpExpr *) node;
+
+            return known_nonnull_function(op->opfuncid) && func_strict(op->opfuncid) &&
+                   args_are_not_null(op->args, query, nullable, grouping_sets);
+        }
+
+        /* IS DISTINCT FROM is exactly the null-aware comparison: never NULL. */
+        case T_DistinctExpr:
+            return true;
+
+        /*
+         * NULLIF shares OpExpr's shape but is the opposite case: it returns
+         * NULL precisely when its arguments are equal, however non-null they
+         * are.
+         */
+        case T_NullIfExpr:
+            return false;
+
+        /*
+         * AND, OR and NOT are three-valued, but only NULL input produces NULL
+         * output, so non-null arguments give a non-null result.
+         */
+        case T_BoolExpr:
+            return args_are_not_null(((BoolExpr *) node)->args, query, nullable,
+                                     grouping_sets);
+
+        /* Tests answer true or false about a value, including about NULL. */
+        case T_NullTest:
+        case T_BooleanTest:
+            return true;
+
+        /* Constructing an array or a row yields a value, never NULL. */
+        case T_ArrayExpr:
+        case T_RowExpr:
+            return true;
+
+        /* Wrappers that change the label or representation, not the value. */
+        case T_RelabelType:
+            return expr_is_not_null((Node *) ((RelabelType *) node)->arg, query,
+                                    nullable, grouping_sets);
+        case T_CoerceViaIO:
+            return false;
+        case T_ArrayCoerceExpr:
+            return expr_is_not_null((Node *) ((ArrayCoerceExpr *) node)->arg,
+                                    query, nullable, grouping_sets);
+        case T_CollateExpr:
+            return expr_is_not_null((Node *) ((CollateExpr *) node)->arg, query,
+                                    nullable, grouping_sets);
+        case T_CoerceToDomain:
+            return expr_is_not_null((Node *) ((CoerceToDomain *) node)->arg,
+                                    query, nullable, grouping_sets);
+
+        /*
+         * Only count(). Every other aggregate returns NULL over no rows, and
+         * over a group whose values are all NULL. Grouping sets do not change
+         * this: they null-extend grouping columns, not aggregates.
+         */
+        case T_Aggref:
+            return is_count_aggregate(((Aggref *) node)->aggfnoid);
+
+        case T_WindowFunc:
+            return is_count_aggregate(((WindowFunc *) node)->winfnoid);
+
+        default:
+            return false;
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * Filter-aware JSON shape analysis
+ * --------------------------------------------------------------------- */
+
+typedef enum JsonShapeKind
+{
+    PD_SHAPE_UNKNOWN,
+    PD_SHAPE_SCALAR,
+    PD_SHAPE_ARRAY,
+    PD_SHAPE_OBJECT
+} JsonShapeKind;
+
+typedef struct JsonShape JsonShape;
+
+typedef struct JsonShapeField
+{
+    char      *name;
+    bool       optional;
+    JsonShape *shape;
+} JsonShapeField;
+
+struct JsonShape
+{
+    JsonShapeKind kind;
+    int           result_not_null;
+    bool          neutral;
+
+    /* scalar */
+    char         *runtime_kind;
+    Oid           type_oid;
+    Oid           source_table;
+    char         *source_column;
+    int           base_not_null;
+
+    /* array */
+    JsonShape    *element;
+
+    /* object */
+    List         *fields;
+    JsonShape    *additional;
+};
+
+static JsonShape *describe_json_value(Node *node, Query *query,
+                                      Bitmapset *nullable,
+                                      bool grouping_sets);
+
+static JsonShape *
+new_shape(JsonShapeKind kind)
+{
+    JsonShape *shape = palloc0(sizeof(JsonShape));
+
+    shape->kind = kind;
+    shape->result_not_null = PD_UNKNOWN;
+    shape->base_not_null = PD_UNKNOWN;
+    shape->type_oid = InvalidOid;
+    shape->source_table = InvalidOid;
+    return shape;
+}
+
+static JsonShape *
+unknown_shape(void)
+{
+    return new_shape(PD_SHAPE_UNKNOWN);
+}
+
+/* PostgreSQL-owned functions only. A same-named function in public is data. */
+static bool
+pg_function_named(Oid funcid, const char *name)
+{
+    char *actual;
+    bool  result;
+
+    if (get_func_namespace(funcid) != PG_CATALOG_NAMESPACE)
+        return false;
+
+    actual = get_func_name(funcid);
+    if (actual == NULL)
+        return false;
+    result = strcmp(actual, name) == 0;
+    pfree(actual);
+    return result;
+}
+
+static bool
+pg_function_in(Oid funcid, const char *const *names, int count)
+{
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (pg_function_named(funcid, names[i]))
+            return true;
+    return false;
+}
+
+/*
+ * Facts which must hold for a boolean expression to be true. They are relation
+ * presence facts here: exact column non-nullness is still represented by the
+ * expression itself, while presence is what removes outer-join extension.
+ */
+static void
+nonnull_expr_relations(Node *node, Bitmapset **facts)
+{
+    if (node == NULL)
+        return;
+
+    switch (nodeTag(node))
+    {
+        case T_Var:
+        {
+            Var *var = (Var *) node;
+
+            if (var->varlevelsup == 0 && var->varattno > 0)
+                *facts = bms_add_member(*facts, var->varno);
+            break;
+        }
+        case T_RelabelType:
+            nonnull_expr_relations((Node *) ((RelabelType *) node)->arg, facts);
+            break;
+        case T_CollateExpr:
+            nonnull_expr_relations((Node *) ((CollateExpr *) node)->arg, facts);
+            break;
+        case T_CoerceViaIO:
+            nonnull_expr_relations((Node *) ((CoerceViaIO *) node)->arg, facts);
+            break;
+        case T_CoerceToDomain:
+            nonnull_expr_relations((Node *) ((CoerceToDomain *) node)->arg, facts);
+            break;
+        case T_FuncExpr:
+        {
+            FuncExpr *func = (FuncExpr *) node;
+            ListCell *lc;
+
+            if (!func_strict(func->funcid))
+                break;
+            foreach(lc, func->args)
+                nonnull_expr_relations((Node *) lfirst(lc), facts);
+            break;
+        }
+        case T_OpExpr:
+        {
+            OpExpr  *op = (OpExpr *) node;
+            ListCell *lc;
+
+            if (!func_strict(op->opfuncid))
+                break;
+            foreach(lc, op->args)
+                nonnull_expr_relations((Node *) lfirst(lc), facts);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static void
+true_expr_relations(Node *node, Bitmapset **facts)
+{
+    if (node == NULL)
+        return;
+
+    if (IsA(node, NullTest))
+    {
+        NullTest *test = (NullTest *) node;
+
+        if (test->nulltesttype == IS_NOT_NULL)
+            nonnull_expr_relations((Node *) test->arg, facts);
+        return;
+    }
+
+    if (IsA(node, BoolExpr))
+    {
+        BoolExpr *boolean = (BoolExpr *) node;
+        ListCell *lc;
+
+        if (boolean->boolop == AND_EXPR)
+        {
+            foreach(lc, boolean->args)
+                true_expr_relations((Node *) lfirst(lc), facts);
+        }
+        else if (boolean->boolop == OR_EXPR)
+        {
+            Bitmapset *common = NULL;
+            bool       first = true;
+
+            foreach(lc, boolean->args)
+            {
+                Bitmapset *branch = NULL;
+
+                true_expr_relations((Node *) lfirst(lc), &branch);
+                if (first)
+                {
+                    common = branch;
+                    first = false;
+                }
+                else
+                    common = bms_intersect(common, branch);
+            }
+            *facts = bms_union(*facts, common);
+        }
+        return;
+    }
+
+    /* A true strict boolean result proves every argument non-null. */
+    nonnull_expr_relations(node, facts);
+}
+
+static bool
+arm_is_present(Node *arm, Bitmapset *facts)
+{
+    Bitmapset *members = NULL;
+    bool       result;
+
+    collect_rtindexes(arm, &members);
+    result = bms_overlap(members, facts);
+    bms_free(members);
+    return result;
+}
+
+static bool
+refine_matched_joins(Node *node, Bitmapset **facts, List **matched)
+{
+    bool changed = false;
+
+    if (node == NULL)
+        return false;
+    if (IsA(node, FromExpr))
+    {
+        ListCell *lc;
+
+        foreach(lc, ((FromExpr *) node)->fromlist)
+            changed |= refine_matched_joins((Node *) lfirst(lc), facts, matched);
+    }
+    else if (IsA(node, JoinExpr))
+    {
+        JoinExpr *join = (JoinExpr *) node;
+        bool      left_present;
+        bool      right_present;
+        bool      is_matched;
+
+        changed |= refine_matched_joins(join->larg, facts, matched);
+        changed |= refine_matched_joins(join->rarg, facts, matched);
+
+        left_present = arm_is_present(join->larg, *facts);
+        right_present = arm_is_present(join->rarg, *facts);
+        is_matched = join->jointype == JOIN_LEFT ? right_present :
+                     join->jointype == JOIN_RIGHT ? left_present :
+                     join->jointype == JOIN_FULL ? left_present && right_present :
+                     false;
+
+        if (is_matched && !list_member_ptr(*matched, join))
+        {
+            *matched = lappend(*matched, join);
+            true_expr_relations((Node *) join->quals, facts);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static void
+find_nullable_except_matched(Node *node, List *matched, Bitmapset **nullable)
+{
+    if (node == NULL)
+        return;
+    if (IsA(node, FromExpr))
+    {
+        ListCell *lc;
+
+        foreach(lc, ((FromExpr *) node)->fromlist)
+            find_nullable_except_matched((Node *) lfirst(lc), matched, nullable);
+    }
+    else if (IsA(node, JoinExpr))
+    {
+        JoinExpr *join = (JoinExpr *) node;
+
+        find_nullable_except_matched(join->larg, matched, nullable);
+        find_nullable_except_matched(join->rarg, matched, nullable);
+
+        if (list_member_ptr(matched, join))
+            return;
+        if (join->jointype == JOIN_LEFT || join->jointype == JOIN_FULL)
+            collect_rtindexes(join->rarg, nullable);
+        if (join->jointype == JOIN_RIGHT || join->jointype == JOIN_FULL)
+            collect_rtindexes(join->larg, nullable);
+    }
+}
+
+static Bitmapset *
+nullable_for_aggregate(Query *query, Node *filter)
+{
+    Bitmapset *facts = NULL;
+    Bitmapset *nullable = NULL;
+    List      *matched = NIL;
+
+    true_expr_relations(filter, &facts);
+    while (refine_matched_joins((Node *) query->jointree, &facts, &matched))
+        ;
+    find_nullable_except_matched((Node *) query->jointree, matched, &nullable);
+    return nullable;
+}
+
+static bool pg_function_named(Oid function, const char *name);
+static Node *first_aggregate_argument(Aggref *aggregate);
+/* Array facts describe successful, non-null results. Rank 0 is an empty array
+ * and is neutral when combining shapes; -1 means unknown. */
+typedef struct ArrayFacts
+{
+    int dimensions;
+    int element_not_null;
+} ArrayFacts;
+
+static ArrayFacts
+unknown_array(void)
+{
+    ArrayFacts facts = {PD_UNKNOWN, PD_UNKNOWN};
+    return facts;
+}
+
+static ArrayFacts
+merge_array_facts(ArrayFacts a, ArrayFacts b)
+{
+    if (a.dimensions == 0) return b;
+    if (b.dimensions == 0) return a;
+    a.dimensions = a.dimensions == b.dimensions ? a.dimensions : PD_UNKNOWN;
+    a.element_not_null = a.element_not_null == 1 && b.element_not_null == 1
+        ? 1 : PD_UNKNOWN;
+    return a;
+}
+
+/* Only positive IS NOT NULL facts on the expression itself are used. */
+static bool
+predicate_proves_nonnull(Node *expression, Node *predicate)
+{
+    ListCell *lc;
+    if (predicate == NULL) return false;
+    if (IsA(predicate, NullTest))
+    {
+        NullTest *test = (NullTest *) predicate;
+        return test->nulltesttype == IS_NOT_NULL && !test->argisrow &&
+               equal(expression, test->arg);
+    }
+    if (!IsA(predicate, BoolExpr)) return false;
+    if (((BoolExpr *) predicate)->boolop == NOT_EXPR) return false;
+    foreach(lc, ((BoolExpr *) predicate)->args)
+    {
+        bool proven = predicate_proves_nonnull(expression, lfirst(lc));
+        if (((BoolExpr *) predicate)->boolop == AND_EXPR && proven) return true;
+        if (((BoolExpr *) predicate)->boolop == OR_EXPR && !proven) return false;
+    }
+    return ((BoolExpr *) predicate)->boolop == OR_EXPR;
+}
+
+/* Normalize just this CHECK's input to a parameter, so equal() compares parsed
+ * expressions and catalog function identities, never constraint names/text. */
+typedef struct ArrayCheckInput
+{
+    AttrNumber attribute;
+    Oid type;
+} ArrayCheckInput;
+
+static Node *
+normalize_array_check(Node *node, void *context)
+{
+    ArrayCheckInput *input = context;
+    if (node == NULL) return NULL;
+    if ((IsA(node, Var) && ((Var *) node)->varattno == input->attribute &&
+         ((Var *) node)->varno == 1) || IsA(node, CoerceToDomainValue))
+    {
+        Param *parameter = makeNode(Param);
+        parameter->paramkind = PARAM_EXTERN;
+        parameter->paramid = 1;
+        parameter->paramtype = input->type;
+        parameter->paramtypmod = -1;
+        parameter->paramcollid = get_typcollation(input->type);
+        parameter->location = -1;
+        return (Node *) parameter;
+    }
+    return expression_tree_mutator(node, normalize_array_check, context);
+}
+
+static bool
+has_array_constraint(Oid relation, AttrNumber attribute, Oid domain, Oid type)
+{
+    Relation catalog;
+    SysScanDesc scan;
+    ScanKeyData key;
+    HeapTuple tuple;
+    bool found = false;
+    Query *expected;
+    ArrayCheckInput input = {attribute, type};
+    const char *sql = "SELECT CASE WHEN $1 IS NULL THEN TRUE "
+        "WHEN pg_catalog.cardinality($1) = 0 THEN TRUE "
+        "WHEN pg_catalog.array_ndims($1) = 1 "
+        "THEN pg_catalog.array_position($1, NULL) IS NULL ELSE FALSE END";
+    RawStmt *raw = linitial_node(RawStmt, pg_parse_query(sql));
+
+    expected = parse_analyze_fixedparams(raw, sql, &type, 1, NULL);
+    catalog = table_open(ConstraintRelationId, AccessShareLock);
+    ScanKeyInit(&key, OidIsValid(relation) ? Anum_pg_constraint_conrelid :
+                Anum_pg_constraint_contypid, BTEqualStrategyNumber, F_OIDEQ,
+                ObjectIdGetDatum(OidIsValid(relation) ? relation : domain));
+    scan = systable_beginscan(catalog, InvalidOid, false, NULL, 1, &key);
+    while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+    {
+        Form_pg_constraint constraint = (Form_pg_constraint) GETSTRUCT(tuple);
+        bool isnull;
+        Datum bin;
+        Node *expression;
+        if (constraint->contype != CONSTRAINT_CHECK || !constraint->convalidated ||
+            constraint->connoinherit)
+            continue;
+#if PG_VERSION_NUM >= 180000
+        if (!constraint->conenforced) continue;
+#endif
+        bin = heap_getattr(tuple, Anum_pg_constraint_conbin,
+                           RelationGetDescr(catalog), &isnull);
+        if (isnull) continue;
+        expression = stringToNode(TextDatumGetCString(bin));
+        expression = normalize_array_check(expression, &input);
+        if (equal(expression, linitial_node(TargetEntry, expected->targetList)->expr))
+        {
+            found = true;
+            break;
+        }
+    }
+    systable_endscan(scan);
+    table_close(catalog, AccessShareLock);
+    return found;
+}
+
+static bool
+domain_proves_array(Oid type)
+{
+    while (get_typtype(type) == TYPTYPE_DOMAIN)
+    {
+        HeapTuple tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+        Oid base;
+        if (!HeapTupleIsValid(tuple)) return false;
+        base = ((Form_pg_type) GETSTRUCT(tuple))->typbasetype;
+        ReleaseSysCache(tuple);
+        if (has_array_constraint(InvalidOid, 0, type, base)) return true;
+        type = base;
+    }
+    return false;
+}
+
+static ArrayFacts array_facts(Node *node, Query *query, Bitmapset *nullable,
+                             bool grouping_sets);
+
+static ArrayFacts
+array_facts(Node *node, Query *query, Bitmapset *nullable, bool grouping_sets)
+{
+    ArrayFacts facts = unknown_array();
+    ListCell *lc;
+    Oid element;
+    if (node == NULL) return facts;
+    check_stack_depth();
+    element = get_element_type(getBaseType(exprType(node)));
+    if (!OidIsValid(element)) return facts;
+    if (domain_proves_array(exprType(node)))
+    {
+        facts.dimensions = 1;
+        facts.element_not_null = 1;
+        return facts;
+    }
+    switch (nodeTag(node))
+    {
+        case T_Const:
+        {
+            Const *value = (Const *) node;
+            ArrayType *array;
+            if (value->constisnull) { facts.dimensions = 0; return facts; }
+            array = DatumGetArrayTypeP(value->constvalue);
+            facts.dimensions = ARR_NDIM(array);
+            facts.element_not_null = array_contains_nulls(array) ? 0 : 1;
+            return facts;
+        }
+        case T_Var:
+        {
+            Oid relation;
+            AttrNumber attribute;
+            Index varno;
+#if PG_VERSION_NUM >= 180000
+            Node *grouped = grouping_step_expr(query, (Var *) node);
+            if (grouped != NULL)
+                return array_facts(grouped, query, nullable, grouping_sets);
+#endif
+            if (resolve_var_column(query, (Var *) node, &relation, &attribute, &varno) &&
+                has_array_constraint(relation, attribute, InvalidOid, exprType(node)))
+            {
+                facts.dimensions = 1;
+                facts.element_not_null = 1;
+            }
+            return facts;
+        }
+        case T_ArrayExpr:
+        {
+            ArrayExpr *array = (ArrayExpr *) node;
+            facts.dimensions = array->elements == NIL ? 0 : 1;
+            facts.element_not_null = 1;
+            if (array->multidims)
+            {
+                bool first = true;
+                foreach(lc, array->elements)
+                {
+                    ArrayFacts child = array_facts(lfirst(lc), query, nullable, grouping_sets);
+                    facts = first ? child : merge_array_facts(facts, child);
+                    first = false;
+                }
+                if (facts.dimensions > 0) facts.dimensions++;
+                return facts;
+            }
+            foreach(lc, array->elements)
+                if (!expr_is_not_null(lfirst(lc), query, nullable, grouping_sets) &&
+                    !predicate_proves_nonnull(lfirst(lc), query->jointree->quals))
+                    facts.element_not_null = PD_UNKNOWN;
+            return facts;
+        }
+        case T_Aggref:
+        {
+            Aggref *agg = (Aggref *) node;
+            Node *argument;
+            if (!pg_function_named(agg->aggfnoid, "array_agg")) return facts;
+            argument = first_aggregate_argument(agg);
+            if (argument == NULL) return facts;
+            nullable = nullable_for_aggregate(query, (Node *) agg->aggfilter);
+            if (OidIsValid(get_element_type(getBaseType(exprType(argument)))))
+            {
+                facts = array_facts(argument, query, nullable, grouping_sets);
+                if (facts.dimensions > 0) facts.dimensions++;
+                return facts;
+            }
+            facts.dimensions = 1;
+            facts.element_not_null =
+                expr_is_not_null(argument, query, nullable, grouping_sets) ||
+                predicate_proves_nonnull(argument, query->jointree->quals) ||
+                predicate_proves_nonnull(argument, (Node *) agg->aggfilter)
+                ? 1 : PD_UNKNOWN;
+            return facts;
+        }
+        case T_SubLink:
+        {
+            SubLink *link = (SubLink *) node;
+            Query *subquery;
+            Node *argument;
+            Bitmapset *subnullable = NULL;
+            if (link->subLinkType != ARRAY_SUBLINK || !IsA(link->subselect, Query))
+                return facts;
+            subquery = (Query *) link->subselect;
+            argument = (Node *) linitial_node(TargetEntry, subquery->targetList)->expr;
+            find_nullable((Node *) subquery->jointree, &subnullable);
+            if (OidIsValid(get_element_type(getBaseType(exprType(argument)))))
+            {
+                facts = array_facts(argument, subquery, subnullable, subquery->groupingSets != NIL);
+                if (facts.dimensions > 0) facts.dimensions++;
+                return facts;
+            }
+            facts.dimensions = 1;
+            facts.element_not_null =
+                expr_is_not_null(argument, subquery, subnullable, subquery->groupingSets != NIL) ||
+                predicate_proves_nonnull(argument, subquery->jointree->quals) ? 1 : PD_UNKNOWN;
+            return facts;
+        }
+        case T_CoalesceExpr:
+        {
+            bool first = true;
+            foreach(lc, ((CoalesceExpr *) node)->args)
+            {
+                ArrayFacts arm = array_facts(lfirst(lc), query, nullable, grouping_sets);
+                facts = first ? arm : merge_array_facts(facts, arm);
+                first = false;
+            }
+            return facts;
+        }
+        case T_CaseExpr:
+        {
+            CaseExpr *expression = (CaseExpr *) node;
+            facts = array_facts((Node *) expression->defresult, query, nullable, grouping_sets);
+            foreach(lc, expression->args)
+                facts = merge_array_facts(facts, array_facts(
+                    (Node *) lfirst_node(CaseWhen, lc)->result, query, nullable, grouping_sets));
+            return facts;
+        }
+        case T_RelabelType:
+            return array_facts((Node *) ((RelabelType *) node)->arg, query, nullable, grouping_sets);
+        case T_CollateExpr:
+            return array_facts((Node *) ((CollateExpr *) node)->arg, query, nullable, grouping_sets);
+        case T_CoerceToDomain:
+            return array_facts((Node *) ((CoerceToDomain *) node)->arg, query, nullable, grouping_sets);
+        case T_ArrayCoerceExpr:
+        {
+            ArrayCoerceExpr *coercion = (ArrayCoerceExpr *) node;
+            facts = array_facts((Node *) coercion->arg, query, nullable, grouping_sets);
+            /* A no-op/domain relabel cannot introduce NULL elements. Other
+             * conversion functions need their own proven rule. */
+            Node *element_expr = (Node *) coercion->elemexpr;
+            while (IsA(element_expr, CoerceToDomain) || IsA(element_expr, RelabelType))
+                element_expr = IsA(element_expr, CoerceToDomain)
+                    ? (Node *) ((CoerceToDomain *) element_expr)->arg
+                    : (Node *) ((RelabelType *) element_expr)->arg;
+            if (!IsA(element_expr, CaseTestExpr))
+                facts.element_not_null = PD_UNKNOWN;
+            return facts;
+        }
+        default:
+            return facts;
+    }
+}
+
+static const char *
+json_runtime_kind(Oid typid)
+{
+    typid = getBaseType(typid);
+
+    if (typid == BOOLOID)
+        return "boolean";
+    switch (typid)
+    {
+        case INT2OID:
+        case INT4OID:
+        case INT8OID:
+        case OIDOID:
+        case FLOAT4OID:
+        case FLOAT8OID:
+        case NUMERICOID:
+            return "number";
+        default:
+            return "string";
+    }
+}
+
+static JsonShape *
+scalar_shape(Node *node, Query *query, Bitmapset *nullable,
+             bool grouping_sets)
+{
+    JsonShape *shape = new_shape(PD_SHAPE_SCALAR);
+    Oid        typid = exprType(node);
+
+    shape->runtime_kind = pstrdup(json_runtime_kind(typid));
+    shape->type_oid = typid;
+    shape->result_not_null = expr_is_not_null(node, query, nullable,
+                                              grouping_sets) ? 1 : 0;
+
+    if (IsA(node, Var))
+    {
+        Oid        relid;
+        AttrNumber attno;
+        Index      varno;
+
+        if (resolve_var_column(query, (Var *) node, &relid, &attno, &varno))
+        {
+            shape->source_table = relid;
+            shape->source_column = get_attname(relid, attno, true);
+            shape->base_not_null = column_is_not_null(relid, attno) ? 1 : 0;
+        }
+    }
+    return shape;
+}
+
+static JsonShape *
+merge_shapes(JsonShape *left, JsonShape *right)
+{
+    JsonShape *merged;
+
+    if (left == NULL)
+        return right;
+    if (right == NULL)
+        return left;
+    if (left->neutral)
+        return right;
+    if (right->neutral)
+        return left;
+    if (left->kind == PD_SHAPE_UNKNOWN || right->kind == PD_SHAPE_UNKNOWN ||
+        left->kind != right->kind)
+        return unknown_shape();
+
+    merged = new_shape(left->kind);
+    merged->result_not_null =
+        left->result_not_null == 1 && right->result_not_null == 1 ? 1 : 0;
+
+    if (left->kind == PD_SHAPE_SCALAR)
+    {
+        if (strcmp(left->runtime_kind, right->runtime_kind) != 0)
+            return unknown_shape();
+        merged->runtime_kind = pstrdup(left->runtime_kind);
+        merged->type_oid = left->type_oid == right->type_oid ?
+                           left->type_oid : InvalidOid;
+        merged->source_table = left->source_table == right->source_table ?
+                               left->source_table : InvalidOid;
+        if (left->source_column != NULL && right->source_column != NULL &&
+            strcmp(left->source_column, right->source_column) == 0)
+            merged->source_column = pstrdup(left->source_column);
+        merged->base_not_null = left->base_not_null == right->base_not_null ?
+                                left->base_not_null : PD_UNKNOWN;
+    }
+    else if (left->kind == PD_SHAPE_ARRAY)
+    {
+        merged->element = merge_shapes(left->element, right->element);
+    }
+    else
+    {
+        ListCell *lc;
+        ListCell *rc;
+
+        if (list_length(left->fields) != list_length(right->fields))
+            return unknown_shape();
+        forboth(lc, left->fields, rc, right->fields)
+        {
+            JsonShapeField *lf = (JsonShapeField *) lfirst(lc);
+            JsonShapeField *rf = (JsonShapeField *) lfirst(rc);
+            JsonShapeField *field;
+
+            if (strcmp(lf->name, rf->name) != 0)
+                return unknown_shape();
+            field = palloc0(sizeof(JsonShapeField));
+            field->name = pstrdup(lf->name);
+            field->optional = lf->optional || rf->optional;
+            field->shape = merge_shapes(lf->shape, rf->shape);
+            merged->fields = lappend(merged->fields, field);
+        }
+        merged->additional = merge_shapes(left->additional, right->additional);
+    }
+    return merged;
+}
+
+static Node *
+unwrap_json_value(Node *node)
+{
+#if PG_VERSION_NUM >= 180000
+    if (IsA(node, JsonValueExpr))
+    {
+        JsonValueExpr *value = (JsonValueExpr *) node;
+
+        return value->raw_expr != NULL ? (Node *) value->raw_expr :
+               (Node *) value->formatted_expr;
+    }
+#endif
+    return node;
+}
+
+static char *
+constant_string(Node *node)
+{
+    Const       *constant;
+    Oid          output;
+    bool         variable_length;
+
+    node = unwrap_json_value(node);
+    while (node != NULL &&
+           (IsA(node, RelabelType) || IsA(node, CoerceViaIO) ||
+            IsA(node, CoerceToDomain)))
+    {
+        if (IsA(node, RelabelType))
+            node = (Node *) ((RelabelType *) node)->arg;
+        else if (IsA(node, CoerceViaIO))
+            node = (Node *) ((CoerceViaIO *) node)->arg;
+        else
+            node = (Node *) ((CoerceToDomain *) node)->arg;
+    }
+    if (node == NULL || !IsA(node, Const))
+        return NULL;
+    constant = (Const *) node;
+    if (constant->constisnull)
+        return NULL;
+    getTypeOutputInfo(constant->consttype, &output, &variable_length);
+    return OidOutputFunctionCall(output, constant->constvalue);
+}
+
+static JsonShape *
+array_shape_from_element(JsonShape *element, int not_null)
+{
+    JsonShape *shape = new_shape(PD_SHAPE_ARRAY);
+
+    shape->element = element == NULL ? unknown_shape() : element;
+    shape->result_not_null = not_null;
+    return shape;
+}
+
+static JsonShape *
+sql_array_shape(Node *node, Query *query, Bitmapset *nullable,
+                bool grouping_sets)
+{
+    Oid        element_type = get_element_type(getBaseType(exprType(node)));
+    JsonShape *element;
+    JsonShape *shape;
+
+    if (!OidIsValid(element_type))
+        return unknown_shape();
+
+    element = new_shape(PD_SHAPE_SCALAR);
+    element->runtime_kind = pstrdup(json_runtime_kind(element_type));
+    element->type_oid = element_type;
+    ArrayFacts facts = array_facts(node, query, nullable, grouping_sets);
+    int depth;
+
+    if (facts.dimensions == PD_UNKNOWN)
+        return unknown_shape();
+    element->result_not_null = facts.element_not_null;
+    for (depth = 1; depth < facts.dimensions; depth++)
+        element = array_shape_from_element(element, 1);
+    shape = array_shape_from_element(element,
+        expr_is_not_null(node, query, nullable, grouping_sets) ? 1 : 0);
+    return shape;
+}
+
+static JsonShape *
+json_object_from_args(List *args, bool absent_on_null, Query *query,
+                      Bitmapset *nullable, bool grouping_sets)
+{
+    JsonShape *object = new_shape(PD_SHAPE_OBJECT);
+    ListCell  *lc;
+    int        index = 0;
+    char      *key = NULL;
+
+    object->result_not_null = 1;
+    foreach(lc, args)
+    {
+        Node *arg = unwrap_json_value((Node *) lfirst(lc));
+
+        if ((index++ % 2) == 0)
+        {
+            key = constant_string(arg);
+            continue;
+        }
+        if (key != NULL)
+        {
+            JsonShapeField *field = palloc0(sizeof(JsonShapeField));
+
+            field->name = key;
+            field->optional = absent_on_null;
+            field->shape = describe_json_value(arg, query, nullable,
+                                               grouping_sets);
+            if (absent_on_null && field->shape->result_not_null != 1)
+                field->shape->result_not_null = 1;
+            object->fields = lappend(object->fields, field);
+            key = NULL;
+        }
+        else
+        {
+            JsonShape *value = describe_json_value(arg, query, nullable,
+                                                   grouping_sets);
+
+            if (absent_on_null && value->result_not_null != 1)
+                value->result_not_null = 1;
+            object->additional = merge_shapes(object->additional, value);
+        }
+    }
+    return object;
+}
+
+static JsonShape *
+json_array_from_args(List *args, bool absent_on_null, Query *query,
+                     Bitmapset *nullable, bool grouping_sets)
+{
+    JsonShape *element = NULL;
+    ListCell  *lc;
+
+    foreach(lc, args)
+    {
+        JsonShape *value = describe_json_value(
+            unwrap_json_value((Node *) lfirst(lc)), query, nullable,
+            grouping_sets);
+
+        if (absent_on_null && value->result_not_null != 1)
+            value->result_not_null = 1;
+        element = merge_shapes(element, value);
+    }
+    if (element == NULL)
+    {
+        element = unknown_shape();
+        element->neutral = true;
+    }
+    return array_shape_from_element(element, 1);
+}
+
+static Node *
+first_aggregate_argument(Aggref *aggregate)
+{
+    ListCell *lc;
+
+    foreach(lc, aggregate->args)
+    {
+        TargetEntry *entry = lfirst_node(TargetEntry, lc);
+
+        if (!entry->resjunk)
+            return (Node *) entry->expr;
+    }
+    return NULL;
+}
+
+static JsonShape *
+describe_json_aggregate(Aggref *aggregate, Query *query,
+                        bool grouping_sets)
+{
+    static const char *const array_names[] = {
+        "json_agg", "jsonb_agg", "json_agg_strict", "jsonb_agg_strict"
+    };
+    static const char *const object_names[] = {
+        "json_object_agg", "jsonb_object_agg",
+        "json_object_agg_strict", "jsonb_object_agg_strict",
+        "json_object_agg_unique", "jsonb_object_agg_unique",
+        "json_object_agg_unique_strict", "jsonb_object_agg_unique_strict"
+    };
+    Bitmapset *nullable;
+    Node      *argument;
+    JsonShape *shape;
+
+    if (!pg_function_in(aggregate->aggfnoid, array_names,
+                        lengthof(array_names)) &&
+        !pg_function_in(aggregate->aggfnoid, object_names,
+                        lengthof(object_names)))
+        return NULL;
+
+    nullable = nullable_for_aggregate(query, (Node *) aggregate->aggfilter);
+    argument = first_aggregate_argument(aggregate);
+
+    if (pg_function_in(aggregate->aggfnoid, array_names,
+                       lengthof(array_names)))
+    {
+        bool strict = pg_function_named(aggregate->aggfnoid, "json_agg_strict") ||
+                      pg_function_named(aggregate->aggfnoid, "jsonb_agg_strict");
+        JsonShape *element = describe_json_value(argument, query, nullable,
+                                                 grouping_sets);
+
+        if (strict && element->result_not_null != 1)
+            element->result_not_null = 1;
+        shape = array_shape_from_element(element, 0);
+    }
+    else
+    {
+        List       *values = NIL;
+        ListCell   *lc;
+        JsonShape  *value = unknown_shape();
+        JsonShape  *object = new_shape(PD_SHAPE_OBJECT);
+        char       *function_name = get_func_name(aggregate->aggfnoid);
+        bool        strict = function_name != NULL &&
+                             strstr(function_name, "strict") != NULL;
+        char       *key = NULL;
+        int         seen = 0;
+
+        foreach(lc, aggregate->args)
+        {
+            TargetEntry *entry = lfirst_node(TargetEntry, lc);
+
+            if (!entry->resjunk)
+                values = lappend(values, entry->expr);
+        }
+        foreach(lc, values)
+        {
+            if (seen == 0)
+                key = constant_string((Node *) lfirst(lc));
+            else if (seen == 1)
+                value = describe_json_value((Node *) lfirst(lc), query,
+                                            nullable, grouping_sets);
+            seen++;
+        }
+        if (strict && value->result_not_null != 1)
+            value->result_not_null = 1;
+        if (key == NULL)
+            object->additional = value;
+        else
+        {
+            JsonShapeField *field = palloc0(sizeof(JsonShapeField));
+
+            field->name = key;
+            field->optional = false;
+            field->shape = value;
+            object->fields = lappend(object->fields, field);
+        }
+        object->result_not_null = 0;
+        shape = object;
+        if (function_name != NULL)
+            pfree(function_name);
+    }
+    return shape;
+}
+
+static JsonShape *
+describe_json_function(FuncExpr *func, Query *query, Bitmapset *nullable,
+                       bool grouping_sets)
+{
+    if (pg_function_named(func->funcid, "json_build_object") ||
+        pg_function_named(func->funcid, "jsonb_build_object"))
+        return json_object_from_args(func->args, false, query, nullable,
+                                     grouping_sets);
+    if (pg_function_named(func->funcid, "json_build_array") ||
+        pg_function_named(func->funcid, "jsonb_build_array"))
+        return json_array_from_args(func->args, false, query, nullable,
+                                    grouping_sets);
+    if (pg_function_named(func->funcid, "to_json") ||
+        pg_function_named(func->funcid, "to_jsonb") ||
+        pg_function_named(func->funcid, "array_to_json") ||
+        pg_function_named(func->funcid, "row_to_json"))
+        return func->args == NIL ? unknown_shape() :
+               describe_json_value((Node *) linitial(func->args), query,
+                                   nullable, grouping_sets);
+    if (pg_function_named(func->funcid, "json_object") ||
+        pg_function_named(func->funcid, "jsonb_object"))
+    {
+        JsonShape *object = new_shape(PD_SHAPE_OBJECT);
+        JsonShape *value = new_shape(PD_SHAPE_SCALAR);
+
+        value->runtime_kind = pstrdup("string");
+        value->type_oid = TEXTOID;
+        value->result_not_null = 1;
+        object->additional = value;
+        object->result_not_null = 1;
+        return object;
+    }
+    return NULL;
+}
+
+#if PG_VERSION_NUM >= 180000
+static JsonShape *
+describe_json_constructor(JsonConstructorExpr *constructor, Query *query,
+                          Bitmapset *nullable, bool grouping_sets)
+{
+    switch (constructor->type)
+    {
+        case JSCTOR_JSON_OBJECT:
+            return json_object_from_args(constructor->args,
+                                         constructor->absent_on_null,
+                                         query, nullable, grouping_sets);
+        case JSCTOR_JSON_ARRAY:
+            return json_array_from_args(constructor->args,
+                                        constructor->absent_on_null,
+                                        query, nullable, grouping_sets);
+        case JSCTOR_JSON_OBJECTAGG:
+        case JSCTOR_JSON_ARRAYAGG:
+            if (constructor->func != NULL && IsA(constructor->func, Aggref))
+                return describe_json_aggregate((Aggref *) constructor->func,
+                                               query, grouping_sets);
+            return unknown_shape();
+        case JSCTOR_JSON_SCALAR:
+            return constructor->args == NIL ? unknown_shape() :
+                   describe_json_value((Node *) linitial(constructor->args),
+                                       query, nullable, grouping_sets);
+        case JSCTOR_JSON_PARSE:
+            return unknown_shape();
+        case JSCTOR_JSON_SERIALIZE:
+            /* Serialization remains JSON only with a JSON RETURNING type. */
+            return getBaseType(exprType((Node *) constructor)) == JSONOID ||
+                   getBaseType(exprType((Node *) constructor)) == JSONBOID ?
+                   unknown_shape() : NULL;
+    }
+    return unknown_shape();
+}
+#endif
+
+static JsonShape *
+describe_json_constant(Const *constant)
+{
+    JsonShape *shape;
+    char      *text;
+
+    if (constant->constisnull)
+    {
+        shape = new_shape(PD_SHAPE_SCALAR);
+        shape->runtime_kind = pstrdup("null");
+        shape->type_oid = constant->consttype;
+        shape->result_not_null = 0;
+        return shape;
+    }
+
+    text = constant_string((Node *) constant);
+    if (text != NULL && strcmp(text, "[]") == 0)
+    {
+        shape = array_shape_from_element(unknown_shape(), 1);
+        shape->neutral = true;
+        shape->element->neutral = true;
+        return shape;
+    }
+    if (text != NULL && strcmp(text, "{}") == 0)
+    {
+        shape = new_shape(PD_SHAPE_OBJECT);
+        shape->result_not_null = 1;
+        shape->neutral = true;
+        return shape;
+    }
+    if (text != NULL &&
+        (strcmp(text, "true") == 0 || strcmp(text, "false") == 0 ||
+         strcmp(text, "null") == 0 || text[0] == '"' ||
+         text[0] == '-' || (text[0] >= '0' && text[0] <= '9')))
+    {
+        shape = new_shape(PD_SHAPE_SCALAR);
+        shape->runtime_kind = pstrdup(
+            strcmp(text, "true") == 0 || strcmp(text, "false") == 0 ?
+            "boolean" : strcmp(text, "null") == 0 ? "null" :
+            text[0] == '"' ? "string" : "number");
+        shape->type_oid = constant->consttype;
+        shape->result_not_null = strcmp(text, "null") == 0 ? 0 : 1;
+        return shape;
+    }
+    return unknown_shape();
+}
+
+static JsonShape *
+describe_row(RowExpr *row, Query *query, Bitmapset *nullable,
+             bool grouping_sets)
+{
+    JsonShape *object = new_shape(PD_SHAPE_OBJECT);
+    ListCell  *arg_cell;
+    ListCell  *name_cell;
+    int        position = 1;
+
+    object->result_not_null = 1;
+    forboth(arg_cell, row->args, name_cell, row->colnames)
+    {
+        JsonShapeField *field = palloc0(sizeof(JsonShapeField));
+        Node           *name_node = (Node *) lfirst(name_cell);
+
+        field->name = IsA(name_node, String) ?
+                      pstrdup(strVal(name_node)) :
+                      psprintf("f%d", position);
+        field->shape = describe_json_value((Node *) lfirst(arg_cell), query,
+                                           nullable, grouping_sets);
+        object->fields = lappend(object->fields, field);
+        position++;
+    }
+    return object;
+}
+
+static JsonShape *
+describe_json_value(Node *node, Query *query, Bitmapset *nullable,
+                    bool grouping_sets)
+{
+    Oid base_type;
+
+    if (node == NULL)
+        return unknown_shape();
+    check_stack_depth();
+    node = unwrap_json_value(node);
+    base_type = getBaseType(exprType(node));
+
+    switch (nodeTag(node))
+    {
+        case T_Const:
+            if (base_type == JSONOID || base_type == JSONBOID)
+                return describe_json_constant((Const *) node);
+            break;
+        case T_FuncExpr:
+        {
+            JsonShape *function = describe_json_function((FuncExpr *) node,
+                                                         query, nullable,
+                                                         grouping_sets);
+            if (function != NULL)
+                return function;
+            break;
+        }
+        case T_Aggref:
+        {
+            JsonShape *aggregate = describe_json_aggregate((Aggref *) node,
+                                                           query,
+                                                           grouping_sets);
+            if (aggregate != NULL)
+                return aggregate;
+            break;
+        }
+        case T_CoalesceExpr:
+        {
+            JsonShape *shape = NULL;
+            ListCell  *lc;
+
+            foreach(lc, ((CoalesceExpr *) node)->args)
+                shape = merge_shapes(shape,
+                    describe_json_value((Node *) lfirst(lc), query, nullable,
+                                        grouping_sets));
+            if (shape != NULL && expr_is_not_null(node, query, nullable,
+                                                  grouping_sets))
+                shape->result_not_null = 1;
+            return shape == NULL ? unknown_shape() : shape;
+        }
+        case T_CaseExpr:
+        {
+            CaseExpr *caseexpr = (CaseExpr *) node;
+            JsonShape *shape = describe_json_value(
+                (Node *) caseexpr->defresult, query, nullable, grouping_sets);
+            ListCell *lc;
+
+            foreach(lc, caseexpr->args)
+                shape = merge_shapes(shape, describe_json_value(
+                    (Node *) lfirst_node(CaseWhen, lc)->result, query,
+                    nullable, grouping_sets));
+            return shape;
+        }
+        case T_SubLink:
+        {
+            SubLink    *link = (SubLink *) node;
+            Query      *subquery;
+            Bitmapset  *subquery_nullable = NULL;
+            ListCell   *lc;
+
+            if (link->subLinkType != EXPR_SUBLINK ||
+                link->subselect == NULL || !IsA(link->subselect, Query))
+                return unknown_shape();
+            subquery = (Query *) link->subselect;
+            find_nullable((Node *) subquery->jointree, &subquery_nullable);
+            foreach(lc, subquery->targetList)
+            {
+                TargetEntry *entry = lfirst_node(TargetEntry, lc);
+                JsonShape   *shape;
+
+                if (entry->resjunk)
+                    continue;
+                shape = describe_json_value((Node *) entry->expr, subquery,
+                    subquery_nullable, subquery->groupingSets != NIL);
+                /* A scalar subquery with no row produces SQL NULL. */
+                if (shape->kind != PD_SHAPE_UNKNOWN)
+                    shape->result_not_null = 0;
+                return shape;
+            }
+            return unknown_shape();
+        }
+        case T_RowExpr:
+            return describe_row((RowExpr *) node, query, nullable,
+                                grouping_sets);
+        case T_RelabelType:
+            return describe_json_value((Node *) ((RelabelType *) node)->arg,
+                                       query, nullable, grouping_sets);
+        case T_CoerceViaIO:
+            return describe_json_value((Node *) ((CoerceViaIO *) node)->arg,
+                                       query, nullable, grouping_sets);
+        case T_CoerceToDomain:
+            return describe_json_value((Node *) ((CoerceToDomain *) node)->arg,
+                                       query, nullable, grouping_sets);
+#if PG_VERSION_NUM >= 180000
+        case T_JsonConstructorExpr:
+            return describe_json_constructor((JsonConstructorExpr *) node,
+                                             query, nullable, grouping_sets);
+#endif
+        default:
+            break;
+    }
+
+    if (base_type == JSONOID || base_type == JSONBOID)
+        return unknown_shape();
+    if (OidIsValid(get_element_type(base_type)))
+        return sql_array_shape(node, query, nullable, grouping_sets);
+    return scalar_shape(node, query, nullable, grouping_sets);
+}
+
+static void
+append_json_nullable(StringInfo buffer, const char *name, int value)
+{
+    appendStringInfo(buffer, ",\"%s\":", name);
+    if (value == PD_UNKNOWN)
+        appendStringInfoString(buffer, "null");
+    else
+        appendStringInfoString(buffer, value != 0 ? "true" : "false");
+}
+
+static void
+append_json_string_property(StringInfo buffer, const char *name,
+                            const char *value)
+{
+    appendStringInfo(buffer, ",\"%s\":", name);
+    if (value == NULL)
+        appendStringInfoString(buffer, "null");
+    else
+        escape_json(buffer, value);
+}
+
+static void append_shape_json(StringInfo buffer, JsonShape *shape);
+
+static void
+append_shape_json(StringInfo buffer, JsonShape *shape)
+{
+    if (shape == NULL || shape->kind == PD_SHAPE_UNKNOWN)
+    {
+        appendStringInfoString(buffer, "{\"kind\":\"unknown\"}");
+        return;
+    }
+    if (shape->kind == PD_SHAPE_SCALAR)
+    {
+        appendStringInfo(buffer,
+            "{\"kind\":\"scalar\",\"runtime\":\"%s\",\"type_oid\":",
+            shape->runtime_kind);
+        if (OidIsValid(shape->type_oid))
+            appendStringInfo(buffer, "%u", shape->type_oid);
+        else
+            appendStringInfoString(buffer, "null");
+        append_json_string_property(buffer, "type_name",
+            OidIsValid(shape->type_oid) ? format_type_be(shape->type_oid) : NULL);
+        appendStringInfoString(buffer, ",\"source_table\":");
+        if (OidIsValid(shape->source_table))
+            appendStringInfo(buffer, "%u", shape->source_table);
+        else
+            appendStringInfoString(buffer, "null");
+        append_json_string_property(buffer, "source_schema",
+            OidIsValid(shape->source_table) ?
+            get_namespace_name(get_rel_namespace(shape->source_table)) : NULL);
+        append_json_string_property(buffer, "source_relation",
+            OidIsValid(shape->source_table) ?
+            get_rel_name(shape->source_table) : NULL);
+        append_json_string_property(buffer, "source_column",
+                                    shape->source_column);
+        append_json_nullable(buffer, "base_not_null", shape->base_not_null);
+        append_json_nullable(buffer, "result_not_null",
+                             shape->result_not_null);
+        appendStringInfoChar(buffer, '}');
+        return;
+    }
+    if (shape->kind == PD_SHAPE_ARRAY)
+    {
+        appendStringInfoString(buffer, "{\"kind\":\"array\"");
+        append_json_nullable(buffer, "result_not_null", shape->result_not_null);
+        appendStringInfoString(buffer, ",\"element\":");
+        append_shape_json(buffer, shape->element);
+        appendStringInfoChar(buffer, '}');
+        return;
+    }
+
+    appendStringInfoString(buffer, "{\"kind\":\"object\"");
+    append_json_nullable(buffer, "result_not_null", shape->result_not_null);
+    appendStringInfoString(buffer, ",\"fields\":[");
+    if (shape->fields != NIL)
+    {
+        ListCell *lc;
+        bool      first = true;
+
+        foreach(lc, shape->fields)
+        {
+            JsonShapeField *field = (JsonShapeField *) lfirst(lc);
+
+            if (!first)
+                appendStringInfoChar(buffer, ',');
+            first = false;
+            appendStringInfoString(buffer, "{\"name\":");
+            escape_json(buffer, field->name);
+            appendStringInfo(buffer, ",\"optional\":%s,\"shape\":",
+                             field->optional ? "true" : "false");
+            append_shape_json(buffer, field->shape);
+            appendStringInfoChar(buffer, '}');
+        }
+    }
+    appendStringInfoString(buffer, "],\"additional\":");
+    if (shape->additional == NULL)
+        appendStringInfoString(buffer, "null");
+    else
+        append_shape_json(buffer, shape->additional);
+    appendStringInfoChar(buffer, '}');
+}
+
+static Jsonb *
+json_shape_for_expression(Node *node, Query *query, Bitmapset *nullable,
+                          bool grouping_sets)
+{
+    Oid         base_type = getBaseType(exprType(node));
+    JsonShape  *shape;
+    StringInfoData json;
+    Datum       parsed;
+
+    if (base_type != JSONOID && base_type != JSONBOID)
+        return NULL;
+    shape = describe_json_value(node, query, nullable, grouping_sets);
+    initStringInfo(&json);
+    append_shape_json(&json, shape);
+    parsed = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data));
+    pfree(json.data);
+    return DatumGetJsonbP(parsed);
+}
+
+/* ------------------------------------------------------------------------
  * Columns
  * --------------------------------------------------------------------- */
 
@@ -357,6 +2126,8 @@ describe_columns(ReturnSetInfo *rsinfo, Query *query, List *tlist)
         char        *source_column = NULL;
         int          base_not_null = PD_UNKNOWN;
         int          result_not_null = PD_UNKNOWN;
+        Jsonb       *result_shape;
+        ArrayFacts   facts;
 
         /*
          * resjunk entries are in the list but not the result: an ORDER BY sort
@@ -374,55 +2145,39 @@ describe_columns(ReturnSetInfo *rsinfo, Query *query, List *tlist)
          */
         if (IsA(tle->expr, Var))
         {
-            Var *var = (Var *) tle->expr;
+            Oid        relid;
+            AttrNumber attno;
+            Index      varno;
 
-            /*
-             * varlevelsup > 0 refers to an enclosing query's range table, so
-             * rt_fetch here would read the wrong entry. varattno <= 0 is a
-             * whole-row reference or system column, with no pg_attribute row.
-             */
-            if (var->varlevelsup == 0 && var->varattno > 0)
+            if (resolve_var_column(query, (Var *) tle->expr, &relid, &attno,
+                                   &varno))
             {
-                RangeTblEntry *rte = rt_fetch(var->varno, query->rtable);
-
-                if (rte->rtekind == RTE_RELATION)
-                {
-                    HeapTuple atup = SearchSysCache2(ATTNUM,
-                                                     ObjectIdGetDatum(rte->relid),
-                                                     Int16GetDatum(var->varattno));
-
-                    /*
-                     * Syscache rather than a query against pg_attribute: a hash
-                     * lookup over a relation analysis has already locked.
-                     */
-                    if (HeapTupleIsValid(atup))
-                    {
-                        Form_pg_attribute att = (Form_pg_attribute) GETSTRUCT(atup);
-
-                        source_table = rte->relid;
-                        source_column = pstrdup(NameStr(att->attname));
-                        base_not_null = att->attnotnull ? 1 : 0;
-
-                        /*
-                         * Non-null in the result only if non-null at the source
-                         * and nothing downstream can null-extend it.
-                         */
-                        if (base_not_null == 0)
-                            result_not_null = 0;
-                        else if (bms_is_member(var->varno, nullable) || grouping_sets)
-                            result_not_null = 0;
-                        else
-                            result_not_null = 1;
-
-                        ReleaseSysCache(atup);
-                    }
-                }
+                source_table = relid;
+                source_column = get_attname(relid, attno, true);
+                base_not_null = column_is_not_null(relid, attno) ? 1 : 0;
             }
         }
 
+        /*
+         * Nullability is asked of every expression, not just of columns. A
+         * column-backed one that is not proven non-null is definitely nullable
+         * -- the source and every join above it are known. Anything else is
+         * only reported when proven, because not proven is not the same as
+         * nullable, and unknown is the answer that fails safe.
+         */
+        if (expr_is_not_null((Node *) tle->expr, query, nullable, grouping_sets))
+            result_not_null = 1;
+        else if (source_table != InvalidOid)
+            result_not_null = 0;
+
+        result_shape = json_shape_for_expression((Node *) tle->expr, query,
+                                                 nullable, grouping_sets);
+
+        facts = array_facts((Node *) tle->expr, query, nullable, grouping_sets);
         emit_row(rsinfo, "column", ord, tle->resname,
                  exprType((Node *) tle->expr),
-                 source_table, source_column, base_not_null, result_not_null);
+                 source_table, source_column, base_not_null, result_not_null,
+                 result_shape, facts.dimensions, facts.element_not_null);
     }
 }
 
@@ -491,7 +2246,7 @@ pg_describe(PG_FUNCTION_ARGS)
     /* Parameters, in $1..$n order. */
     for (i = 0; i < num_params; i++)
         emit_row(rsinfo, "param", i + 1, NULL, param_types[i],
-                 InvalidOid, NULL, PD_UNKNOWN, PD_UNKNOWN);
+                 InvalidOid, NULL, PD_UNKNOWN, PD_UNKNOWN, NULL, PD_UNKNOWN, PD_UNKNOWN);
 
     /*
      *   SELECT               -> targetList

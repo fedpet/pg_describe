@@ -4,6 +4,10 @@ title: Credit
 sidebar_label: Credit
 ---
 
+This project is an independently maintained fork of
+[sajonaro/pg_describe](https://github.com/sajonaro/pg_describe). The original
+license and copyright notice are retained.
+
 The idea is taken from [**pgTyped**](https://github.com/adelsz/pgtyped) by
 [Adel Salakh](https://github.com/adelsz), which demonstrated that you can
 generate honest TypeScript types from a live PostgreSQL database rather than

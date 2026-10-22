@@ -67,9 +67,6 @@ integrations, migration checks that answer "which of our 300 queries does this
 `ALTER TABLE` break?", and anything else that needs a query's contract without
 its side effects.
 
-[`pg-describe-gen`](end-to-end-example.md) is the first consumer: it turns a
-directory of plain `.sql` files into typed TypeScript.
-
 ## Why nullability is the interesting part
 
 `attnotnull` says whether a *source column* is declared `NOT NULL`. Whether a
@@ -95,7 +92,6 @@ null-dereference on the first guest order.
 
 - [Features](features.md) — the list, if you are comparing tools
 - [Getting started](getting-started.md) — a working database in one command
-- [End-to-end example](end-to-end-example.md) — schema to failing build, in full
 - [The pg_describe function](function-reference.md) — the reference
 
 ## Credit

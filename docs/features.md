@@ -27,17 +27,9 @@ sidebar_label: Features
 - **Errors point at your query.** A parse error's caret is relocated into the
   described statement rather than the `pg_describe(` call.
 
-## TypeScript code generation
+## Structured result metadata
 
-[`pg-describe-gen`](cli-configuration.md) is bundled:
-
-- **Query files are plain SQL.** Native `$1` placeholders, no dialect — the file
-  you generate types from is the file you can paste into `psql`.
-- **Typed parameters, rows and functions** generated per query, with SQL
-  comments carried through as JSDoc.
-- **`--check` mode** for CI: exit 1 when the committed output no longer matches
-  what the database says, so a breaking migration fails the pull request rather
-  than the deploy.
-- **Configurable type mapping**, with sensible defaults — `bigint` and `numeric`
-  map to `string` because that is what node-postgres returns. See
-  [Type mapping](type-mapping.md).
+JSON and JSONB constructors expose recursive object and array shapes, including
+scalar types, provenance and nullability. SQL arrays expose their provable rank
+and element nullability. Unknown facts stay unknown so consumers can generate
+conservative types. See [Function reference](function-reference.md).

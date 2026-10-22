@@ -7,111 +7,90 @@ sidebar_label: Contributing
 ## Repository layout
 
 ```
-src/pg_describe.c        the extension
-sql/                     the extension's SQL script
-test/                    pg_regress suite: sql/ and expected/
-packages/codegen/        pg-describe-gen, published to npm
-examples/typescript/     runnable example, generated output committed
+src/pg_describe.c        extension implementation
+sql/                     installation and upgrade scripts
+test/                    pg_regress suite and upgrade checks
+scripts/                 release metadata checks
 docs/                    documentation source
-website/                 Docusaurus site that renders docs/
+website/                 independently built documentation site
 ```
 
-`packages/*` and `examples/*` are npm workspaces, so a single `npm install` at
-the repository root wires the example to the local generator. `website/` is
-deliberately outside the workspaces, so building the generator does not pull a
-documentation toolchain.
-
-## The extension
+## Testing
 
 ```bash
-docker compose up -d --build
-docker compose cp ./test db:/src/pg_describe/
-docker compose exec db bash -lc \
+python3 scripts/check-release.py
+docker compose up -d --build --wait db
+docker compose exec -T db bash -lc \
   'cd /src/pg_describe && PGUSER=postgres PGHOST=/var/run/postgresql \
    PGDATABASE=contrib_regression make installcheck'
+docker compose exec -T db psql -X -U postgres -d postgres \
+  -v ON_ERROR_STOP=1 -f /src/pg_describe/test/upgrades.sql
 ```
 
-29 assertions covering parameter inference, provenance, join shapes and their
-nesting, grouping sets, statement shapes, error handling and four permission
-scenarios. `regression.diffs` holds the failure detail.
+The regression suite covers parameter inference, provenance, expression
+nullability, joins, grouping, JSON shapes, arrays, errors and permissions.
+The upgrade checks compare the function definition and described results after
+each supported upgrade path with a fresh installation. They run in a transaction
+that is rolled back.
 
-A change to the analysis belongs with a test in `test/sql/pg_describe.sql` and
-its expected output — the suite is the specification of what the flags mean.
+Analysis changes belong with regression SQL and expected output. CI tests
+PostgreSQL 18. Existing compatibility code can remain without making additional
+server versions supported.
 
-## The generator
+## Documentation
+
+Pages live in `docs/` and render directly on GitHub. To build the site:
 
 ```bash
-npm install            # from the repository root
+cd website
+npm ci
 npm run build
-
-docker compose up -d --build
-docker compose exec -T db psql -U postgres -d pg_describe_demo -q \
-  < examples/typescript/schema.sql
-
-export PGHOST=localhost PGPORT=5432 PGUSER=postgres \
-       PGPASSWORD=postgres PGDATABASE=pg_describe_demo
-
-npm run check          # committed output still matches the database
-npm run typecheck
-npm run demo
 ```
 
-`npm run check` is the assertion that matters: regenerating against a live
-database must reproduce the committed file byte for byte. It fails if the
-extension's output changes, if the emitter changes, or if the schema drifts.
-When a change is meant to alter the output, run `npm run generate` and commit
-the result as part of the same change.
+New pages need an entry in `website/sidebars.ts`. The website's Node dependencies
+are used only for documentation.
 
-## The documentation
+## Versions
 
-Pages live in `docs/` as plain Markdown with Docusaurus frontmatter, and render
-on GitHub as they are. The site is built separately:
+The extension uses semantic versions independently of PostgreSQL server versions:
+
+- Patch: correctness fixes preserving the documented contract.
+- Minor: backward-compatible capabilities.
+- Major: incompatible function signatures or metadata behavior.
+
+Git tags use `vMAJOR.MINOR.PATCH`; PostgreSQL extension versions omit the `v`.
+Never edit or move a released tag. Historical installation and update scripts
+remain unchanged; new releases add scripts instead.
+
+## Preparing a release
+
+1. Update `pg_describe.control` and both extension versions in `META.json`.
+2. Add the new installation script and update scripts from supported versions.
+   The Makefile installs all versioned SQL scripts. A C-only fix can use an empty
+   update script to advance the installed version.
+3. Add release notes under `## VERSION` in `CHANGELOG.md`.
+4. Update upgrade checks to cover the supported paths and target version.
+5. Run metadata, regression, upgrade and documentation checks, then merge the
+   preparation PR into `main`.
+
+The first independently maintained release is 2.0.0. It removes the bundled
+language-specific generator and establishes the JSON and array metadata API.
+
+## Publishing a release
+
+After the preparation PR is merged and its checks pass:
 
 ```bash
-npm --prefix website install
-npm run docs           # local dev server with hot reload
-npm run docs:build     # production build into website/build
+python3 scripts/check-release.py --tag v2.0.0
+git tag -a v2.0.0 -m "pg_describe 2.0.0"
+git push origin v2.0.0
 ```
 
-New pages need an entry in `website/sidebars.ts`.
+The tag workflow reruns CI, verifies that the commit belongs to `main` and that
+the tag matches the extension metadata, then publishes a GitHub release with a
+source archive and SHA-256 checksum. Notes come from the matching changelog
+entry. There is no registry publication or binary distribution.
 
-## CI
-
-Every push and pull request builds the extension image, runs `pg_regress`,
-builds the generator, regenerates the example against a live database and
-type-checks it, and builds the documentation site. The site deploys to GitHub
-Pages from `main`.
-
-## Releasing
-
-Both halves ship from one tag.
-
-```bash
-# bump packages/codegen/package.json to the new version first, then:
-git tag -a v1.1.0 -m "pg_describe 1.1.0"
-git push origin v1.1.0
-```
-
-The tag does two things:
-
-- **npm.** `.github/workflows/publish-npm.yml` publishes `pg-describe-gen` via
-  trusted publishing — GitHub mints a short-lived OIDC token, npm accepts it
-  because the package's trusted publisher names this repository and that
-  workflow file, and provenance is attached automatically. No token exists to
-  leak. The job refuses to run if the tag and `package.json` disagree, and skips
-  cleanly if the version is already on the registry.
-- **PGXN.** Build the distribution archive and upload it at
-  https://manager.pgxn.org/ — this step is manual, since PGXN has no API token
-  flow here.
-
-  ```bash
-  git archive --format=zip --prefix=pg_describe-1.1.0/ -o pg_describe-1.1.0.zip v1.1.0
-  ```
-
-  `website/` is `export-ignore`d, so the archive carries the extension and its
-  tests rather than the documentation toolchain.
-
-A release also needs `pg_describe.control`, `META.json` and the versioned file
-in `sql/` to agree on the number, and a matching
-`sql/pg_describe--<old>--<new>.sql` upgrade script when the SQL interface
-changes.
+The workflow assembles a draft with all assets before publishing it, so it also
+works when release immutability is enabled in repository settings. A published
+version is final; corrections need a new patch release.

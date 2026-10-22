@@ -6,6 +6,14 @@ CREATE TABLE a (id int PRIMARY KEY, a_val text NOT NULL);
 CREATE TABLE b (id int PRIMARY KEY, a_id int, b_val text NOT NULL);
 CREATE TABLE c (id int PRIMARY KEY, b_id int, c_val text NOT NULL);
 CREATE TABLE users (id int PRIMARY KEY, email text NOT NULL, note text);
+CREATE TABLE json_membership (
+  user_id int PRIMARY KEY REFERENCES users(id),
+  property_id int NOT NULL,
+  approved boolean NOT NULL,
+  permissions text[] NOT NULL CHECK (CASE WHEN permissions IS NULL THEN TRUE WHEN cardinality(permissions) = 0 THEN TRUE WHEN array_ndims(permissions) = 1 THEN array_position(permissions, NULL) IS NULL ELSE FALSE END),
+  external_ids uuid[] NOT NULL CHECK (CASE WHEN external_ids IS NULL THEN TRUE WHEN cardinality(external_ids) = 0 THEN TRUE WHEN array_ndims(external_ids) = 1 THEN array_position(external_ids, NULL) IS NULL ELSE FALSE END)
+);
+CREATE TABLE json_property (id int PRIMARY KEY, name text NOT NULL);
 
 -- ===========================================================================
 -- Parameters: inferred, with nothing declared.
@@ -39,11 +47,108 @@ FROM pg_describe('SELECT email AS who FROM users') WHERE kind = 'column';
 SELECT count(*) = 1 AS ok
 FROM pg_describe('SELECT email FROM users ORDER BY id') WHERE kind = 'column';
 
--- An expression has a type but no source, and no opinion on nullability.
+-- An expression has a type but no source column to name. Its nullability is a
+-- separate question, answered below.
 SELECT source_table IS NULL AND source_column IS NULL
-   AND base_not_null IS NULL AND result_not_null IS NULL
+   AND base_not_null IS NULL
    AND type_name = 'text' AS ok
 FROM pg_describe('SELECT upper(email) FROM users') WHERE kind = 'column';
+
+-- ===========================================================================
+-- Nullability of expressions.
+--
+-- Everything here reports NULL -- unknown -- unless it is proven, so each pair
+-- of cases checks both that a provable one is proven and that the neighbouring
+-- unprovable one is not silently claimed.
+-- ===========================================================================
+
+-- A strict function returns NULL only when an argument is NULL, so over a
+-- NOT NULL column it cannot.
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT upper(email) FROM users') WHERE kind = 'column';
+
+-- The same function over a nullable column proves nothing.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT upper(note) FROM users') WHERE kind = 'column';
+
+-- Strictness composes through operators too.
+SELECT result_not_null AS ok
+FROM pg_describe($$SELECT email || '!' FROM users$$) WHERE kind = 'column';
+
+-- A zero-argument function is not proven by strictness: with no arguments the
+-- property says nothing about the result.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT random()') WHERE kind = 'column';
+
+-- COALESCE is NULL only when every argument is, so one non-null settles it.
+SELECT result_not_null AS ok
+FROM pg_describe($$SELECT coalesce(note, 'none') FROM users$$)
+WHERE kind = 'column';
+
+-- ... and two nullable arguments settle nothing.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT coalesce(note, note) FROM users')
+WHERE kind = 'column';
+
+-- A literal is non-null; a NULL literal is not.
+SELECT result_not_null AS ok
+FROM pg_describe($$SELECT 'hi'::text$$) WHERE kind = 'column';
+
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT NULL::text') WHERE kind = 'column';
+
+-- Every arm of a CASE must be non-null, the ELSE included.
+SELECT result_not_null AS ok
+FROM pg_describe($$SELECT CASE WHEN id > 0 THEN email ELSE 'x' END FROM users$$)
+WHERE kind = 'column';
+
+-- A CASE with no ELSE yields NULL when nothing matches.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT CASE WHEN id > 0 THEN email END FROM users')
+WHERE kind = 'column';
+
+-- count() returns 0 over no rows; every other aggregate returns NULL.
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT count(*) FROM users') WHERE kind = 'column';
+
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT sum(id) FROM users') WHERE kind = 'column';
+
+-- As a window function too.
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT count(*) OVER () FROM users') WHERE kind = 'column';
+
+-- A test answers true or false about a value, including about NULL.
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT note IS NULL FROM users') WHERE kind = 'column';
+
+-- IS DISTINCT FROM is the null-aware comparison, so it is never NULL...
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT email IS DISTINCT FROM note FROM users')
+WHERE kind = 'column';
+
+-- ... while NULLIF shares its shape and is the opposite case, returning NULL
+-- precisely when its arguments are equal, however non-null they are.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe($$SELECT nullif(email, 'x') FROM users$$) WHERE kind = 'column';
+
+-- Constructing an array yields a value, never NULL.
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT ARRAY[email] FROM users') WHERE kind = 'column';
+
+-- The load-bearing case. b_val is NOT NULL, so strictness would prove upper()
+-- of it non-null -- but the outer join null-extends it, and the Var underneath
+-- the expression is what carries that. An implementation that reasoned about
+-- the function without reaching the column would claim non-null here and hand
+-- back a crash.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT upper(b.b_val) FROM a LEFT JOIN b ON b.a_id = a.id')
+WHERE kind = 'column';
+
+-- Same for grouping sets, which null-extend the grouping column underneath.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT upper(email) FROM users GROUP BY ROLLUP(email)')
+WHERE kind = 'column';
 
 -- ===========================================================================
 -- Nullability. This is what pg_describe has that attnotnull alone does not.
@@ -121,6 +226,43 @@ SELECT base_not_null AND result_not_null AS ok
 FROM pg_describe('SELECT email, count(*) FROM users GROUP BY email')
 WHERE kind = 'column' AND ord = 1;
 
+-- A grouped column keeps its provenance. From v18 the parser puts an RTE_GROUP
+-- between the target list and the range table, so the Var in the target list
+-- names the grouping step rather than the relation; resolving through it is
+-- what keeps these two answers the same as they are without a GROUP BY.
+SELECT source_table::text = 'users' AND source_column = 'email' AS ok
+FROM pg_describe('SELECT email, count(*) FROM users GROUP BY email')
+WHERE kind = 'column' AND ord = 1;
+
+-- Grouping by an expression has no source column to name, with or without the
+-- grouping step in the way.
+SELECT source_table IS NULL AND source_column IS NULL AS ok
+FROM pg_describe('SELECT upper(email) FROM users GROUP BY upper(email)')
+WHERE kind = 'column' AND ord = 1;
+
+-- Having no source column does not make it unknown. The expression is still
+-- there to be proven, and grouping does not change what upper() of a NOT NULL
+-- column can return. This is also the version parity case: before v18 the
+-- target list holds the FuncExpr itself, from v18 it holds a Var into the
+-- grouping step, and both have to answer the same.
+SELECT result_not_null AS ok
+FROM pg_describe('SELECT upper(email) FROM users GROUP BY upper(email)')
+WHERE kind = 'column' AND ord = 1;
+
+-- The same expression under grouping sets is not proven, because a
+-- super-aggregate row nulls the grouped column whatever produced it.
+SELECT result_not_null IS NULL AS ok
+FROM pg_describe('SELECT upper(email) FROM users GROUP BY ROLLUP(upper(email))')
+WHERE kind = 'column' AND ord = 1;
+
+-- Resolving through the grouping step must not lose the outer join underneath
+-- it: b_val is NOT NULL and grouped, and still nullable because the join
+-- null-extends it.
+SELECT base_not_null AND NOT result_not_null AS ok
+FROM pg_describe(
+  'SELECT b.b_val, count(*) FROM a LEFT JOIN b ON b.a_id = a.id GROUP BY b.b_val')
+WHERE kind = 'column' AND ord = 1;
+
 -- The claim is not merely internally consistent -- it matches what the server
 -- actually does. Expected to be f, which is exactly what result_not_null said
 -- and what base_not_null did not.
@@ -128,6 +270,103 @@ INSERT INTO a VALUES (1, 'only-a');
 SELECT bool_or(b.b_val IS NOT NULL) AS ok
 FROM a LEFT JOIN b ON b.a_id = a.id;
 DELETE FROM a;
+
+-- ===========================================================================
+-- Recursive shapes for constructed JSON/JSONB.
+-- ===========================================================================
+
+-- Non-JSON columns have no shape; arbitrary stored JSON has an explicit
+-- unknown shape rather than a guessed one.
+SELECT result_shape IS NULL AS ok
+FROM pg_describe('SELECT email FROM users') WHERE kind = 'column';
+
+SELECT result_shape = '{"kind":"unknown"}'::jsonb AS ok
+FROM pg_describe('SELECT $1::json') WHERE kind = 'column';
+
+-- Legacy constructors preserve field order, scalar runtime kinds, and SQL
+-- arrays recursively. uuid[] is an array here even though some drivers return
+-- a top-level uuid[] column as a raw PostgreSQL literal.
+SELECT result_shape #>> '{kind}' = 'array'
+   AND result_shape #>> '{element,kind}' = 'object'
+   AND result_shape #>> '{element,fields,0,name}' = 'id'
+   AND result_shape #>> '{element,fields,0,shape,runtime}' = 'number'
+   AND result_shape #>> '{element,fields,1,name}' = 'permissions'
+   AND result_shape #>> '{element,fields,1,shape,kind}' = 'array'
+   AND result_shape #>> '{element,fields,2,shape,kind}' = 'array' AS ok
+FROM pg_describe(
+  $$SELECT json_build_array(json_build_object(
+       'id', user_id,
+       'permissions', permissions,
+       'external_ids', external_ids))
+    FROM json_membership$$)
+WHERE kind = 'column';
+
+-- Scalar subqueries keep the shape of their single JSON result. This is the
+-- common form for correlated nested lists in a larger projection.
+SELECT result_shape #>> '{kind}' = 'array'
+   AND result_shape #>> '{element,fields,0,name}' = 'id' AS ok
+FROM pg_describe(
+  $$SELECT coalesce(
+       (SELECT json_agg(json_build_object('id', p.id))
+        FROM json_property p),
+       '[]'::json)$$)
+WHERE kind = 'column';
+
+-- The empty-array COALESCE fallback is neutral and makes the aggregate result
+-- non-null without erasing its element shape.
+SELECT result_shape #>> '{kind}' = 'array'
+   AND (result_shape #>> '{result_not_null}')::boolean
+   AND result_shape #>> '{element,fields,0,name}' = 'id' AS ok
+FROM pg_describe(
+  $$SELECT coalesce(
+       json_agg(json_build_object('id', p.id))
+         FILTER (WHERE p.id IS NOT NULL),
+       '[]'::json)
+    FROM users u
+    LEFT JOIN json_membership m ON m.user_id = u.id
+    LEFT JOIN json_property p ON p.id = m.property_id$$)
+WHERE kind = 'column';
+
+-- p.id proves the second LEFT JOIN matched. Its strict equality then proves
+-- m matched too, so fields from both nullable arms become non-null.
+SELECT (result_shape #>>
+          '{element,fields,0,shape,result_not_null}')::boolean
+   AND (result_shape #>>
+          '{element,fields,1,shape,result_not_null}')::boolean AS ok
+FROM pg_describe(
+  $$SELECT json_agg(json_build_object(
+       'property', p.name,
+       'approved', m.approved)) FILTER (WHERE p.id IS NOT NULL)
+    FROM users u
+    LEFT JOIN json_membership m ON m.user_id = u.id
+    LEFT JOIN json_property p ON p.id = m.property_id$$)
+WHERE kind = 'column';
+
+-- SQL/JSON constructors use their dedicated PostgreSQL 18 parse nodes. The
+-- fallback keeps the same regression file runnable on PostgreSQL 17.
+SELECT CASE WHEN current_setting('server_version_num')::int >= 180000
+       THEN result_shape #>> '{kind}' = 'object'
+        AND (result_shape #>> '{fields,0,optional}')::boolean
+       ELSE result_shape #>> '{kind}' = 'object'
+       END AS ok
+FROM pg_describe(
+  CASE WHEN current_setting('server_version_num')::int >= 180000
+       THEN $$SELECT json_object('id' VALUE id ABSENT ON NULL RETURNING jsonb)
+              FROM users$$
+       ELSE $$SELECT json_build_object('id', id) FROM users$$
+  END)
+WHERE kind = 'column';
+
+-- Names are not enough: a user function which shadows a constructor is not a
+-- PostgreSQL constructor and must stay unknown.
+CREATE FUNCTION public.json_build_object(text, text) RETURNS json
+LANGUAGE SQL IMMUTABLE AS $$SELECT '{}'::json$$;
+SET search_path = public, pg_catalog;
+SELECT result_shape = '{"kind":"unknown"}'::jsonb AS ok
+FROM pg_describe('SELECT json_build_object(email, email) FROM users')
+WHERE kind = 'column';
+RESET search_path;
+DROP FUNCTION public.json_build_object(text, text);
 
 -- ===========================================================================
 -- Statement shapes.
@@ -203,3 +442,40 @@ REVOKE ALL ON users FROM pd_nobody;
 REVOKE ALL ON SCHEMA public FROM pd_nobody;
 REVOKE ALL ON FUNCTION pg_describe(text) FROM pd_nobody;
 DROP ROLE pd_nobody;
+
+-- SQL type declarations do not enforce array rank or element nullability.
+CREATE TABLE pd_arrays (
+  unchecked integer[][],
+  checked integer[] CHECK (CASE WHEN checked IS NULL THEN TRUE
+    WHEN cardinality(checked) = 0 THEN TRUE
+    WHEN array_ndims(checked) = 1 THEN array_position(checked, NULL) IS NULL
+    ELSE FALSE END),
+  pending integer[]
+);
+ALTER TABLE pd_arrays ADD CHECK (CASE WHEN pending IS NULL THEN TRUE
+  WHEN cardinality(pending) = 0 THEN TRUE
+  WHEN array_ndims(pending) = 1 THEN array_position(pending, NULL) IS NULL
+  ELSE FALSE END) NOT VALID;
+SELECT name, array_dimensions, array_element_not_null
+FROM pg_describe('select unchecked, checked, pending from pd_arrays') WHERE kind = 'column';
+SELECT name, array_dimensions, array_element_not_null
+FROM pg_describe('select array[1,2] as flat, array[1,null] as nullable, array[[1,2],[3,4]] as nested, array[]::int[] as empty') WHERE kind = 'column';
+CREATE DOMAIN pd_flat AS integer[] CHECK (CASE WHEN VALUE IS NULL THEN TRUE
+  WHEN cardinality(VALUE) = 0 THEN TRUE
+  WHEN array_ndims(VALUE) = 1 THEN array_position(VALUE, NULL) IS NULL
+  ELSE FALSE END);
+CREATE DOMAIN pd_flat_chain AS pd_flat;
+SELECT name, array_dimensions, array_element_not_null
+FROM pg_describe('select unchecked::pd_flat_chain as domain, array_agg(checked) as nested, array_agg(unchecked) as unknown from pd_arrays group by unchecked') WHERE kind = 'column';
+SELECT name, array_dimensions, array_element_not_null
+FROM pg_describe('select array_agg(v) as nullable, array_agg(v) filter(where v is not null) as filtered from (values(1),(null)) t(v)') WHERE kind = 'column';
+SELECT name, array_dimensions, array_element_not_null
+FROM pg_describe('select array(select v from (values(1),(null)) t(v) where v is not null) as filtered') WHERE kind = 'column';
+CREATE FUNCTION pd_null(integer) RETURNS integer LANGUAGE sql STRICT AS 'select null::integer';
+SELECT result_not_null IS NOT TRUE AS ok FROM pg_describe('select pd_null(1)') WHERE kind = 'column';
+SELECT result_shape ->> 'kind' = 'unknown' AS ok
+FROM pg_describe('select to_json(unchecked) from pd_arrays') WHERE kind = 'column';
+DROP FUNCTION pd_null(integer);
+DROP DOMAIN pd_flat_chain;
+DROP DOMAIN pd_flat;
+DROP TABLE pd_arrays;
