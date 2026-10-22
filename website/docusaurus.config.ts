@@ -16,7 +16,7 @@ const config: Config = {
   tagline: 'Ask PostgreSQL what a query would return, without running it',
   favicon: 'img/favicon.svg',
 
-  url: `https://${organization}.github.io`,
+  url: 'https://pettinari.ch',
   baseUrl: `/${project}/`,
   organizationName: organization,
   projectName: project,
