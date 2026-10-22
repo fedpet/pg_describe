@@ -1,8 +1,4 @@
----
-id: function-reference
-title: The pg_describe function
-sidebar_label: Function reference
----
+# The pg_describe function
 
 ```sql
 pg_describe(sql text) RETURNS TABLE (

@@ -1,9 +1,4 @@
----
-id: overview
-title: Overview
-sidebar_label: Overview
-slug: /
----
+# Overview
 
 `pg_describe` is a PostgreSQL extension that answers one question: **what would
 this query return, if I ran it?**

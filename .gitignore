@@ -12,11 +12,6 @@ node_modules/
 dist/
 *.tsbuildinfo
 
-# docusaurus
-website/build/
-website/.docusaurus/
-.cache-loader/
-
 # editor and OS noise
 .vscode/
 .idea/

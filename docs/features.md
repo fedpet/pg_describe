@@ -1,8 +1,4 @@
----
-id: features
-title: Features
-sidebar_label: Features
----
+# Features
 
 - **Nothing is executed.** Parse and analysis only; the executor is never
   reached. Describing `DELETE FROM orders WHERE id = $1` deletes nothing.

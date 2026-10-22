@@ -1,8 +1,4 @@
----
-id: contributing
-title: Contributing
-sidebar_label: Contributing
----
+# Contributing
 
 ## Repository layout
 
@@ -12,7 +8,6 @@ sql/                     installation and upgrade scripts
 test/                    pg_regress suite and upgrade checks
 scripts/                 release metadata checks
 docs/                    documentation source
-website/                 independently built documentation site
 ```
 
 ## Testing
@@ -39,16 +34,8 @@ server versions supported.
 
 ## Documentation
 
-Pages live in `docs/` and render directly on GitHub. To build the site:
-
-```bash
-cd website
-npm ci
-npm run build
-```
-
-New pages need an entry in `website/sidebars.ts`. The website's Node dependencies
-are used only for documentation.
+Documentation lives in `docs/` as Markdown and is read directly on GitHub.
+Keep links relative so they work in the repository and source archives.
 
 ## Versions
 
@@ -70,7 +57,7 @@ remain unchanged; new releases add scripts instead.
    update script to advance the installed version.
 3. Add release notes under `## VERSION` in `CHANGELOG.md`.
 4. Update upgrade checks to cover the supported paths and target version.
-5. Run metadata, regression, upgrade and documentation checks, then merge the
+5. Run metadata, regression and upgrade checks, then merge the
    preparation PR into `main`.
 
 The first independently maintained release is 2.0.0. It removes the bundled

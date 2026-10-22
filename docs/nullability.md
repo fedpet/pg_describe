@@ -1,8 +1,4 @@
----
-id: nullability
-title: Nullability
-sidebar_label: Nullability
----
+# Nullability
 
 This is the reason the extension exists rather than a catalog query.
 

@@ -1,8 +1,4 @@
----
-id: credit
-title: Credit
-sidebar_label: Credit
----
+# Credit
 
 This project is an independently maintained fork of
 [sajonaro/pg_describe](https://github.com/sajonaro/pg_describe). The original

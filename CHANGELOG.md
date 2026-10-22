@@ -7,6 +7,8 @@ First independently maintained release, based on sajonaro/pg_describe.
 ### Breaking changes
 
 - Remove the bundled TypeScript generator, its examples, and npm publication.
+- Remove the documentation website, its build tooling, and Pages deployment;
+  keep documentation as Markdown in the repository.
 - Extend the function result with recursive JSON shapes, SQL array dimensions,
   and array element nullability.
 - Support and test PostgreSQL 18.
