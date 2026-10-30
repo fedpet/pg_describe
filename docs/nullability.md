@@ -85,7 +85,7 @@ itself:
 | | |
 | --- | --- |
 | Literals | Non-null unless the literal is NULL. |
-| Strict functions and operators | Non-null when every argument is. Strictness is recorded per function in `pg_proc`; `upper(x)`, `a \|\| b` and most casts are strict. |
+| Functions and operators | Shared semantic proofs establish non-null results. Known null-preserving functions such as `upper(x)` require non-null arguments; clocks such as `now()` are always non-null. Strictness alone is insufficient. |
 | `COALESCE` | Non-null when any argument is. |
 | `CASE` | Non-null when every arm is, `ELSE` included. A `CASE` with no `ELSE` yields NULL when nothing matches. |
 | `count()` | Always non-null: it returns 0 over no rows, where every other aggregate returns NULL. |
@@ -93,8 +93,8 @@ itself:
 | `ARRAY[...]`, `ROW(...)` | Always non-null: constructing a value never yields NULL. |
 | Anything else | Unknown. |
 
-The reasoning is the planner's own rather than a heuristic, and it composes: it
-reaches the columns underneath, so an outer join still wins.
+The proofs use catalog-resolved identities and expression semantics. They reach
+the underlying columns, so an outer join still wins.
 
 ```sql
 SELECT upper(b.b_val) FROM a LEFT JOIN b ON b.a_id = a.id
@@ -106,8 +106,8 @@ reasoned about the function without reaching the column would claim non-null
 here and hand back a crash. That case is in the regression suite.
 
 Two shapes worth naming because they look provable and are not. A
-zero-argument function is not proven by strictness -- with no arguments the
-property says nothing about the result. And `NULLIF` shares the shape of an
+zero-argument function needs a semantic guarantee; strictness says nothing
+about its result. And `NULLIF` shares the shape of an
 operator but is the opposite case: it returns NULL precisely when its arguments
 are equal, however non-null they are.
 
@@ -124,3 +124,30 @@ row nulls the grouped column whatever produced it.
 Only `result_not_null = true` proves that a result cannot be NULL. Treat both
 false and unknown as nullable when generating types. Parameter rows do not prove
 that a parameter is non-null; consumers choose their own parameter policy.
+
+
+## Function bodies and bulk introspection
+
+Query description and `pg_describe_functions` share the same function proofs.
+A proof is a sufficient condition over non-null input arguments, never a claim
+that a failed proof means the function returns NULL. Unknown stays nullable.
+
+Built-in facts identify exact overloads in `pg_catalog`, so a user function or
+another overload cannot inherit a guarantee from its name. SQL bodies can prove
+additional conditions through parameters, constants, CASE, COALESCE and nested
+calls. STRICT adds the requirement that every argument is non-null; it never
+establishes a result proof by itself. Stored default expressions are analyzed
+without executing them when positional arguments are omitted.
+
+Body inference requires a single scalar SELECT with a guaranteed result row
+and a target of the declared result type. A NOT NULL target over a potentially
+empty query does not prove the function non-null. Return coercions, named calls,
+security-definer functions, functions with local settings, opaque languages,
+unsupported expressions and recursive dependencies remain conservative.
+String SQL bodies use PostgreSQL's parameter hooks. Expected analysis failures
+are isolated in an internal subtransaction; cancellation and unexpected failures
+still propagate. Neither discovery nor proof inference plans or executes a body.
+
+Proof depth and formula size are bounded. Reaching a bound loses precision,
+never correctness. Function summaries are cached only within an analysis call,
+so catalog changes cannot leave persistent stale semantic facts.

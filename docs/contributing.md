@@ -3,7 +3,8 @@
 ## Repository layout
 
 ```
-src/pg_describe.c        extension implementation
+src/pg_describe.c        query description
+src/functions.c          routine discovery and shared function proofs
 sql/                     installation and upgrade scripts
 test/                    pg_regress suite and upgrade checks
 scripts/                 release metadata checks
@@ -68,9 +69,9 @@ language-specific generator and establishes the JSON and array metadata API.
 After the preparation PR is merged and its checks pass:
 
 ```bash
-python3 scripts/check-release.py --tag v2.0.0
-git tag -a v2.0.0 -m "pg_describe 2.0.0"
-git push origin v2.0.0
+python3 scripts/check-release.py --tag v2.1.0
+git tag -a v2.1.0 -m "pg_describe 2.1.0"
+git push origin v2.1.0
 ```
 
 The tag workflow reruns CI, verifies that the commit belongs to `main` and that

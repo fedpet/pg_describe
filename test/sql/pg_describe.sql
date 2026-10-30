@@ -62,8 +62,7 @@ FROM pg_describe('SELECT upper(email) FROM users') WHERE kind = 'column';
 -- unprovable one is not silently claimed.
 -- ===========================================================================
 
--- A strict function returns NULL only when an argument is NULL, so over a
--- NOT NULL column it cannot.
+-- A known null-preserving function is non-null over a NOT NULL column.
 SELECT result_not_null AS ok
 FROM pg_describe('SELECT upper(email) FROM users') WHERE kind = 'column';
 
@@ -75,9 +74,8 @@ FROM pg_describe('SELECT upper(note) FROM users') WHERE kind = 'column';
 SELECT result_not_null AS ok
 FROM pg_describe($$SELECT email || '!' FROM users$$) WHERE kind = 'column';
 
--- A zero-argument function is not proven by strictness: with no arguments the
--- property says nothing about the result.
-SELECT result_not_null IS NULL AS ok
+-- Zero-argument functions need a semantic proof, independent of strictness.
+SELECT result_not_null AS ok
 FROM pg_describe('SELECT random()') WHERE kind = 'column';
 
 -- COALESCE is NULL only when every argument is, so one non-null settles it.

@@ -11,8 +11,8 @@
 EXTENSION    = pg_describe
 DATA         = $(wildcard sql/pg_describe--*.sql)
 MODULE_big   = pg_describe
-OBJS         = src/pg_describe.o
-REGRESS      = pg_describe
+OBJS         = src/pg_describe.o src/functions.o
+REGRESS      = pg_describe functions
 REGRESS_OPTS = --inputdir=test
 
 PG_CONFIG ?= pg_config

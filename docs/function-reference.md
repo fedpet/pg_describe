@@ -122,3 +122,40 @@ LINE 1: SELECT id, emial FROM users
 HINT:  Perhaps you meant to reference the column "users.email".
 QUERY:  SELECT id, emial FROM users
 ```
+
+
+## Bulk routine discovery
+
+`pg_describe_functions(schemas text[] DEFAULT NULL)` returns every routine in
+the selected schemas for which the caller has schema USAGE and function EXECUTE.
+NULL selects all accessible schemas; an empty array selects none. Procedures,
+aggregates, window functions, set-returning functions and unsupported types stay
+in the result, even when no non-null proof is available. Consumers choose which
+signatures they can represent. Row order is unspecified.
+
+Each row contains the routine OID, exact schema and name, kind, input type OIDs,
+return type OID, set-returning flag, default argument count, variadic element
+OID (zero when absent), strictness, catalog argument names and default-expression
+non-null facts. Argument names retain the catalog's complete names array,
+including OUT arguments where present. `all_argument_types` and `argument_modes`
+retain the catalog arrays needed to pair these names with input/output types;
+NULL means the routine has only ordinary IN arguments. `volatility` is the
+catalog's immutable/stable/volatile code. OIDs are database-local identities and
+must not be embedded into generated runtime code.
+
+`nonnull_when` is a JSON array of sufficient clauses. Each clause contains
+one-based input argument positions whose non-nullness suffices together;
+any proven clause proves the result non-null:
+
+- `[]`: no proof.
+- `[[]]`: always non-null on successful scalar evaluation.
+- `[[1,2]]`: non-null when both inputs are non-null.
+- `[[1],[2]]`: non-null when either input is non-null.
+
+`default_not_null` follows the trailing defaulted input arguments. A true entry
+proves that omitted argument's default non-null. A false entry means unproven.
+Function conditions refer to the complete positional signature, including
+arguments with defaults. The strict flag is independent of the result proof.
+
+The bulk call shares dependency analysis across routines. It does not invoke
+functions, infer guarantees from sample values, or persist an analysis cache.
