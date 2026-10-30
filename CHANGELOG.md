@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.0
+
+- Add bulk routine introspection with exact signatures, defaults and symbolic non-null conditions.
+- Share function proofs with query description, including clocks and analyzable SQL bodies.
+- Keep unknown, recursive, opaque and potentially empty SQL bodies conservative.
+
 ## 2.0.0
 
 First independently maintained release, based on sajonaro/pg_describe.

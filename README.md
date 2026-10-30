@@ -19,8 +19,10 @@ FROM pg_describe('SELECT id, email FROM users WHERE id = $1');
 The extension uses PostgreSQL's parser and analyser. It reports parameter and
 result types, source-column provenance, outer-join-aware nullability, recursive
 JSON shapes, and provable SQL array rank and element nullability. Rewrite,
-planning and execution are never reached. Access privileges are checked before
-metadata is returned.
+planning and execution are never reached.
+`pg_describe_functions` discovers built-in and user routines in bulk and reports
+symbolic non-null guarantees using the same function analysis as query
+description. Access privileges are checked before metadata is returned.
 
 ## Get started
 

@@ -1,0 +1,159 @@
+-- Bulk discovery includes every routine kind, without executing any of them.
+CREATE SCHEMA function_tests;
+CREATE FUNCTION function_tests.identity_text(value text) RETURNS text LANGUAGE sql RETURN value;
+CREATE FUNCTION function_tests.fallback(a text, b text) RETURNS text LANGUAGE sql RETURN coalesce(a,b);
+CREATE FUNCTION function_tests.always_text(a text) RETURNS text LANGUAGE sql RETURN coalesce(a,'fallback');
+CREATE FUNCTION function_tests.strict_fallback(a text) RETURNS text LANGUAGE sql STRICT RETURN coalesce(a,'fallback');
+CREATE FUNCTION function_tests.string_body(value text) RETURNS text LANGUAGE sql AS 'SELECT upper(value)';
+CREATE FUNCTION function_tests.nested(value text) RETURNS text LANGUAGE sql RETURN function_tests.string_body(value);
+CREATE FUNCTION function_tests.conditional(value text, flag boolean) RETURNS text LANGUAGE sql RETURN CASE WHEN flag THEN value ELSE 'fallback' END;
+CREATE FUNCTION function_tests.defaulted(value text DEFAULT 'fallback') RETURNS text LANGUAGE sql RETURN value;
+CREATE FUNCTION function_tests.named_defaults(a text DEFAULT NULL, b text DEFAULT 'fallback') RETURNS text LANGUAGE sql RETURN b;
+CREATE TYPE function_tests.return_enum AS ENUM ('value');
+CREATE FUNCTION function_tests.null_cast(value text) RETURNS function_tests.return_enum LANGUAGE sql STRICT RETURN NULL::function_tests.return_enum;
+CREATE CAST (text AS function_tests.return_enum) WITH FUNCTION function_tests.null_cast(text) AS ASSIGNMENT;
+CREATE FUNCTION function_tests.coerced() RETURNS function_tests.return_enum LANGUAGE sql AS 'SELECT ''value''::text';
+CREATE FUNCTION function_tests.maybe_empty(value text) RETURNS text LANGUAGE sql RETURN (SELECT value WHERE false);
+CREATE FUNCTION function_tests.filtered(value text) RETURNS text LANGUAGE sql AS 'SELECT value WHERE false';
+CREATE FUNCTION function_tests.opaque(value text) RETURNS text LANGUAGE plpgsql STRICT AS $$ BEGIN RETURN NULL; END $$;
+CREATE FUNCTION function_tests.dangerous() RETURNS integer LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'must never execute'; END $$;
+SET check_function_bodies = false;
+CREATE FUNCTION function_tests.unresolvable() RETURNS integer LANGUAGE sql AS 'SELECT nonexistent_column';
+RESET check_function_bodies;
+CREATE FUNCTION function_tests.recursive(value text) RETURNS text LANGUAGE sql AS 'SELECT function_tests.recursive(value)';
+CREATE FUNCTION function_tests.upper(value text) RETURNS text LANGUAGE sql RETURN NULL::text;
+CREATE FUNCTION function_tests.identity_text(value integer) RETURNS integer LANGUAGE sql RETURN value;
+CREATE FUNCTION function_tests.set_values() RETURNS SETOF integer LANGUAGE sql RETURN 1;
+CREATE FUNCTION function_tests.outputs(a integer, OUT label text, OUT amount integer) RETURNS record LANGUAGE sql AS 'SELECT a::text, a';
+CREATE PROCEDURE function_tests.action() LANGUAGE sql AS 'SELECT 1';
+SELECT function_name, argument_types::regtype[], kind, returns_set, nonnull_when,
+       default_arguments, default_not_null
+FROM pg_describe_functions(ARRAY['function_tests'])
+ORDER BY function_name, argument_types::regtype[]::text;
+  function_name  | argument_types |   kind    | returns_set | nonnull_when | default_arguments | default_not_null 
+-----------------+----------------+-----------+-------------+--------------+-------------------+------------------
+ action          | {}             | procedure | f           | []           |                 0 | {}
+ always_text     | {text}         | function  | f           | [[]]         |                 0 | {}
+ coerced         | {}             | function  | f           | []           |                 0 | {}
+ conditional     | {text,boolean} | function  | f           | [[1]]        |                 0 | {}
+ dangerous       | {}             | function  | f           | []           |                 0 | {}
+ defaulted       | {text}         | function  | f           | [[1]]        |                 1 | {t}
+ fallback        | {text,text}    | function  | f           | [[1], [2]]   |                 0 | {}
+ filtered        | {text}         | function  | f           | []           |                 0 | {}
+ identity_text   | {integer}      | function  | f           | [[1]]        |                 0 | {}
+ identity_text   | {text}         | function  | f           | [[1]]        |                 0 | {}
+ maybe_empty     | {text}         | function  | f           | []           |                 0 | {}
+ named_defaults  | {text,text}    | function  | f           | [[2]]        |                 2 | {f,t}
+ nested          | {text}         | function  | f           | [[1]]        |                 0 | {}
+ null_cast       | {text}         | function  | f           | []           |                 0 | {}
+ opaque          | {text}         | function  | f           | []           |                 0 | {}
+ outputs         | {integer}      | function  | f           | []           |                 0 | {}
+ recursive       | {text}         | function  | f           | []           |                 0 | {}
+ set_values      | {}             | function  | t           | []           |                 0 | {}
+ strict_fallback | {text}         | function  | f           | [[1]]        |                 0 | {}
+ string_body     | {text}         | function  | f           | [[1]]        |                 0 | {}
+ unresolvable    | {}             | function  | f           | []           |                 0 | {}
+ upper           | {text}         | function  | f           | []           |                 0 | {}
+(22 rows)
+
+SELECT argument_types::regtype[], all_argument_types::regtype[], argument_modes,
+       argument_names, volatility
+FROM pg_describe_functions(ARRAY['function_tests']) WHERE function_name = 'outputs';
+ argument_types |   all_argument_types   | argument_modes |  argument_names  | volatility 
+----------------+------------------------+----------------+------------------+------------
+ {integer}      | {integer,text,integer} | {i,o,o}        | {a,label,amount} | v
+(1 row)
+
+SELECT count(*) = 0 AS empty_selection FROM pg_describe_functions(ARRAY[]::text[]);
+ empty_selection 
+-----------------
+ t
+(1 row)
+
+SELECT count(*) > 3000 AS includes_builtins FROM pg_describe_functions();
+ includes_builtins 
+-------------------
+ t
+(1 row)
+
+SELECT function_name, argument_types::regtype[], nonnull_when
+FROM pg_describe_functions(ARRAY['pg_catalog'])
+WHERE function_name IN ('now','upper','uuidv7')
+ORDER BY function_name, argument_types::regtype[]::text;
+ function_name | argument_types  | nonnull_when 
+---------------+-----------------+--------------
+ now           | {}              | [[]]
+ upper         | {anymultirange} | []
+ upper         | {anyrange}      | []
+ upper         | {text}          | [[1]]
+ uuidv7        | {}              | [[]]
+ uuidv7        | {interval}      | [[1]]
+(6 rows)
+
+-- The same proofs drive ordinary SQL query description.
+SELECT name, result_not_null
+FROM pg_describe($q$SELECT
+  function_tests.identity_text('hello') AS identity,
+  function_tests.string_body('hello') AS string_body,
+  function_tests.nested('hello') AS nested,
+  function_tests.fallback(NULL,'hello') AS fallback,
+  function_tests.always_text(NULL) AS always,
+  function_tests.strict_fallback(NULL) AS strict,
+  function_tests.defaulted() AS defaulted,
+  function_tests.named_defaults(b => NULL) AS named,
+  function_tests.coerced() AS coerced,
+  function_tests.filtered('hello') AS empty,
+  function_tests.opaque('hello') AS opaque,
+  function_tests.upper('hello') AS shadow,
+  function_tests.recursive('hello') AS recursive,
+  1.25::numeric::float8 AS numeric_cast,
+  'null'::jsonb::float8 AS json_cast,
+  now() AS clock$q$)
+WHERE kind = 'column' ORDER BY name;
+     name     | result_not_null 
+--------------+-----------------
+ always       | t
+ clock        | t
+ coerced      | 
+ defaulted    | t
+ empty        | 
+ fallback     | t
+ identity     | t
+ json_cast    | 
+ named        | 
+ nested       | t
+ numeric_cast | t
+ opaque       | 
+ recursive    | 
+ shadow       | 
+ strict       | 
+ string_body  | t
+(16 rows)
+
+-- Catalog discovery honours namespace USAGE and function EXECUTE permissions.
+CREATE ROLE function_reader;
+GRANT USAGE ON SCHEMA function_tests TO function_reader;
+REVOKE EXECUTE ON FUNCTION function_tests.dangerous() FROM PUBLIC;
+SET ROLE function_reader;
+SELECT count(*) = 0 AS hidden_without_execute
+FROM pg_describe_functions(ARRAY['function_tests']) WHERE function_name = 'dangerous';
+ hidden_without_execute 
+------------------------
+ t
+(1 row)
+
+RESET ROLE;
+REVOKE USAGE ON SCHEMA function_tests FROM function_reader;
+SET ROLE function_reader;
+SELECT count(*) = 0 AS hidden_without_usage FROM pg_describe_functions(ARRAY['function_tests']);
+ hidden_without_usage 
+----------------------
+ t
+(1 row)
+
+RESET ROLE;
+DROP OWNED BY function_reader;
+DROP ROLE function_reader;
+SET client_min_messages = warning;
+DROP SCHEMA function_tests CASCADE;
+RESET client_min_messages;

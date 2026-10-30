@@ -20,6 +20,7 @@
  *                        inner query.
  */
 #include "postgres.h"
+#include "functions.h"
 #include "fmgr.h"
 
 #include "funcapi.h"
@@ -492,34 +493,6 @@ is_count_aggregate(Oid aggfnoid)
     return result;
 }
 
-/* STRICT is only the implication NULL input -> NULL output. */
-static bool
-known_nonnull_function(Oid function)
-{
-    static const char *const names[] = {
-        "upper", "lower", "length", "char_length", "btrim", "ltrim", "rtrim",
-        "date_trunc", "textcat", "int2", "int4", "int8", "float4", "float8",
-        "numeric", "text", "varchar", "date", "timestamp", "timestamptz",
-        "int2eq", "int2ne", "int2lt", "int2le", "int2gt", "int2ge",
-        "int4eq", "int4ne", "int4lt", "int4le", "int4gt", "int4ge",
-        "int8eq", "int8ne", "int8lt", "int8le", "int8gt", "int8ge",
-        "texteq", "textne", "text_lt", "text_le", "text_gt", "text_ge",
-        "uuid_eq", "uuid_ne", "uuid_lt", "uuid_le", "uuid_gt", "uuid_ge",
-        "int4pl", "int4mi", "int4mul", "int4div", "int8pl", "int8mi",
-        "booland_statefunc", "boolor_statefunc", "booleq", "boolne"
-    };
-    char *name;
-    int i;
-
-    if (get_func_namespace(function) != PG_CATALOG_NAMESPACE)
-        return false;
-    name = get_func_name(function);
-    for (i = 0; i < lengthof(names); i++)
-        if (name != NULL && strcmp(name, names[i]) == 0)
-            return true;
-    return false;
-}
-
 static bool expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
                              bool grouping_sets);
 
@@ -555,9 +528,8 @@ args_are_not_null(List *args, Query *query, Bitmapset *nullable,
  * the direction that matters: over-declaring a null costs one impossible check
  * in the caller, under-declaring one costs a crash.
  *
- * The reasoning is the planner's own, not a heuristic. Strictness is recorded
- * per function in pg_proc, and everything else here is a property of the node
- * type rather than a guess about it.
+ * Function proofs are shared with bulk introspection; other cases use the
+ * semantics of the expression node. Strictness alone never proves a result.
  */
 static bool
 expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
@@ -658,16 +630,32 @@ expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
         {
             FuncExpr *func = (FuncExpr *) node;
 
-            return known_nonnull_function(func->funcid) && func_strict(func->funcid) &&
-                   args_are_not_null(func->args, query, nullable, grouping_sets);
+            List *facts = NIL;
+            ListCell *lc;
+            if (func->funcretset)
+                return false;
+            foreach(lc, func->args)
+            {
+                if (IsA(lfirst(lc), NamedArgExpr))
+                    return false;
+                facts = lappend_int(facts, expr_is_not_null(lfirst(lc), query,
+                                                          nullable, grouping_sets));
+            }
+            return pd_function_result_not_null(func->funcid, facts);
         }
 
         case T_OpExpr:
         {
             OpExpr *op = (OpExpr *) node;
 
-            return known_nonnull_function(op->opfuncid) && func_strict(op->opfuncid) &&
-                   args_are_not_null(op->args, query, nullable, grouping_sets);
+            List *facts = NIL;
+            ListCell *lc;
+            if (op->opretset)
+                return false;
+            foreach(lc, op->args)
+                facts = lappend_int(facts, expr_is_not_null(lfirst(lc), query,
+                                                          nullable, grouping_sets));
+            return pd_function_result_not_null(op->opfuncid, facts);
         }
 
         /* IS DISTINCT FROM is exactly the null-aware comparison: never NULL. */
@@ -693,6 +681,7 @@ expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
         /* Tests answer true or false about a value, including about NULL. */
         case T_NullTest:
         case T_BooleanTest:
+        case T_SQLValueFunction:
             return true;
 
         /* Constructing an array or a row yields a value, never NULL. */
