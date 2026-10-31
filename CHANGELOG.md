@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.2.0
+
+- Add statement/COPY transport metadata and language-neutral finite value facts.
+- Infer direct validated text/enum membership, domain intersections and array-element containment without executing expressions.
+- Refine positive WHERE non-null facts conservatively and retain unknown facts for opaque or volatile expressions.
+- Describe CALL OUT/INOUT result columns without invoking procedures.
+
 ## 2.1.0
 
 - Add bulk routine introspection with exact signatures, defaults and symbolic non-null conditions.

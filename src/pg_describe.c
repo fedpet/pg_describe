@@ -30,6 +30,13 @@
 #include "access/table.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_enum.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_class.h"
+#include "commands/defrem.h"
+#include "tcop/cmdtag.h"
+#include "tcop/utility.h"
+#include "optimizer/optimizer.h"
 #include "nodes/makefuncs.h"
 #include "nodes/readfuncs.h"
 #include "utils/fmgroids.h"
@@ -287,6 +294,11 @@ static void
 check_permissions(Query *query)
 {
     ListCell *lc;
+    if (query->utilityStmt != NULL && IsA(query->utilityStmt,CallStmt)) {
+        CallStmt *call=(CallStmt *)query->utilityStmt;
+        AclResult permission=object_aclcheck(ProcedureRelationId,call->funcexpr->funcid,GetUserId(),ACL_EXECUTE);
+        if(permission!=ACLCHECK_OK) aclcheck_error(permission,OBJECT_PROCEDURE,get_func_name(call->funcexpr->funcid));
+    }
 
     foreach(lc, query->rteperminfos)
     {
@@ -493,6 +505,7 @@ is_count_aggregate(Oid aggfnoid)
     return result;
 }
 
+static bool predicate_proves_nonnull(Node *expression, Node *predicate);
 static bool expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
                              bool grouping_sets);
 
@@ -540,6 +553,9 @@ expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
 
     /* Expressions nest arbitrarily deeply; this is the standard guard. */
     check_stack_depth();
+
+    if (IsA(node, Var) && !grouping_sets && query->jointree &&
+        predicate_proves_nonnull(node, query->jointree->quals)) return true;
 
     switch (nodeTag(node))
     {
@@ -725,6 +741,184 @@ expr_is_not_null(Node *node, Query *query, Bitmapset *nullable,
  * Filter-aware JSON shape analysis
  * --------------------------------------------------------------------- */
 
+/* Language-neutral finite text/enum values. Unknown and an empty set differ. */
+typedef struct FiniteValues { bool known; List *values; } FiniteValues;
+static FiniteValues finite_unknown(void) { FiniteValues v = {false, NIL}; return v; }
+static FiniteValues finite_known(List *values) { FiniteValues v = {true, values}; return v; }
+static bool finite_has(List *values, const char *value) {
+    ListCell *lc; foreach(lc, values) if (strcmp(lfirst(lc), value) == 0) return true;
+    return false;
+}
+static FiniteValues finite_intersect(FiniteValues a, FiniteValues b) {
+    List *values = NIL; ListCell *lc;
+    if (!a.known) return b;
+    if (!b.known) return a;
+    foreach(lc, a.values) if (finite_has(b.values, lfirst(lc))) values = lappend(values, lfirst(lc));
+    return finite_known(values);
+}
+static FiniteValues finite_union(FiniteValues a, FiniteValues b) {
+    List *values; ListCell *lc;
+    if (!a.known || !b.known) return finite_unknown();
+    values = list_copy(a.values);
+    foreach(lc, b.values) if (!finite_has(values, lfirst(lc))) values = lappend(values, lfirst(lc));
+    return finite_known(values);
+}
+static Node *finite_unwrap(Node *node) {
+    while (node && (IsA(node, RelabelType) || IsA(node, CoerceToDomain)))
+        node = IsA(node, RelabelType) ? (Node *) ((RelabelType *) node)->arg : (Node *) ((CoerceToDomain *) node)->arg;
+    return node;
+}
+static char *finite_constant(Datum value, Oid type) {
+    Oid base = getBaseType(type);
+    if (base == TEXTOID || base == VARCHAROID) return TextDatumGetCString(value);
+    if (get_typtype(base) == TYPTYPE_ENUM) {
+        HeapTuple tuple = SearchSysCache1(ENUMOID, value);
+        char *label;
+        if (!HeapTupleIsValid(tuple)) return NULL;
+        label = pstrdup(NameStr(((Form_pg_enum) GETSTRUCT(tuple))->enumlabel));
+        ReleaseSysCache(tuple); return label;
+    }
+    return NULL;
+}
+static FiniteValues finite_array(Node *node, bool check) {
+    List *values = NIL; ListCell *lc;
+    node = finite_unwrap(node);
+    if (node == NULL) return finite_unknown();
+    if (IsA(node, ArrayExpr)) {
+        ArrayExpr *array = (ArrayExpr *) node;
+        if (array->multidims) return finite_unknown();
+        foreach(lc, array->elements) {
+            Node *item = finite_unwrap(lfirst(lc)); char *value;
+            if (!IsA(item, Const)) return finite_unknown();
+            if (((Const *) item)->constisnull) { if(check) return finite_unknown(); continue; }
+            value = finite_constant(((Const *) item)->constvalue, ((Const *) item)->consttype);
+            if(value == NULL) return finite_unknown();
+            if(!finite_has(values,value)) values=lappend(values,value);
+        }
+        return finite_known(values);
+    }
+    if (IsA(node, Const) && !((Const *) node)->constisnull) {
+        Const *constant = (Const *) node; Oid element = get_element_type(getBaseType(constant->consttype));
+        Datum *items; bool *nulls; int count, index; int16 length; bool byval; char align;
+        if(!OidIsValid(element)) return finite_unknown();
+        get_typlenbyvalalign(element,&length,&byval,&align);
+        deconstruct_array(DatumGetArrayTypeP(constant->constvalue),element,length,byval,align,&items,&nulls,&count);
+        for(index=0;index<count;index++) {
+            char *value;
+            if(nulls[index]) { if(check) return finite_unknown(); continue; }
+            value=finite_constant(items[index],element);
+            if(value==NULL) return finite_unknown();
+            if(!finite_has(values,value)) values=lappend(values,value);
+        }
+        return finite_known(values);
+    }
+    return finite_unknown();
+}
+static bool finite_equality(Oid operator, Oid collation) {
+    Oid function=get_opcode(operator);
+    return (function==F_TEXTEQ || function==F_ENUM_EQ) &&
+        (!OidIsValid(collation) || get_collation_isdeterministic(collation));
+}
+static bool finite_array_equality(Node *array) {
+    Oid element=get_element_type(getBaseType(exprType(array)));
+    TypeCacheEntry *cache;
+    if(!OidIsValid(element)) return false;
+    cache=lookup_type_cache(element,TYPECACHE_EQ_OPR_FINFO);
+    return cache->eq_opr_finfo.fn_oid==F_TEXTEQ || cache->eq_opr_finfo.fn_oid==F_ENUM_EQ;
+}
+static FiniteValues finite_predicate(Node *target,Node *predicate,bool check,bool element) {
+    ListCell *lc;
+    if(predicate==NULL) return finite_unknown();
+    check_stack_depth();
+    if(IsA(predicate,BoolExpr)) {
+        BoolExpr *boolean=(BoolExpr *)predicate; FiniteValues result=finite_unknown(); bool first=true;
+        if(boolean->boolop==NOT_EXPR) return result;
+        foreach(lc,boolean->args) {
+            FiniteValues child=finite_predicate(target,lfirst(lc),check,element);
+            result=first?child:boolean->boolop==AND_EXPR?finite_intersect(result,child):finite_union(result,child);first=false;
+        }
+        return result;
+    }
+    if(!element && IsA(predicate,ScalarArrayOpExpr)) {
+        ScalarArrayOpExpr *op=(ScalarArrayOpExpr *)predicate;
+        if(op->useOr && finite_equality(op->opno,op->inputcollid) && equal(finite_unwrap(target),finite_unwrap(linitial(op->args))))
+            return finite_array(lsecond(op->args),check);
+    }
+    if(IsA(predicate,OpExpr)) {
+        OpExpr *op=(OpExpr *)predicate; Node *left,*right;
+        if(list_length(op->args)!=2) return finite_unknown();
+        left=finite_unwrap(linitial(op->args));right=finite_unwrap(lsecond(op->args));
+        if(element && get_opcode(op->opno)==F_ARRAYCONTAINED && finite_array_equality(left) &&
+           (!OidIsValid(op->inputcollid)||get_collation_isdeterministic(op->inputcollid)) && equal(finite_unwrap(target),left)) return finite_array(right,false);
+        if(!element && finite_equality(op->opno,op->inputcollid)) {
+            Const *constant; char *value;
+            if(equal(finite_unwrap(target),left) && IsA(right,Const)) constant=(Const *)right;
+            else if(equal(finite_unwrap(target),right) && IsA(left,Const)) constant=(Const *)left;
+            else return finite_unknown();
+            if(constant->constisnull) return check?finite_unknown():finite_known(NIL);
+            value=finite_constant(constant->constvalue,constant->consttype);
+            if(value!=NULL) return finite_known(list_make1(value));
+        }
+    }
+    return finite_unknown();
+}
+typedef struct FiniteInput { AttrNumber attribute; Node *target; } FiniteInput;
+static Node *finite_replace(Node *node,void *context) {
+    FiniteInput *input=context;
+    if(node==NULL) return NULL;
+    if(IsA(node,CoerceToDomainValue) || (IsA(node,Var) && ((Var *)node)->varno==1 && ((Var *)node)->varattno==input->attribute)) return copyObject(input->target);
+    return expression_tree_mutator(node,finite_replace,context);
+}
+static FiniteValues finite_constraints(Node *target,Oid relation,AttrNumber attribute,Oid domain,bool element) {
+    Relation catalog=table_open(ConstraintRelationId,AccessShareLock); SysScanDesc scan; ScanKeyData key; HeapTuple tuple;
+    FiniteValues result=finite_unknown(); FiniteInput input={attribute,target};
+    ScanKeyInit(&key,OidIsValid(relation)?Anum_pg_constraint_conrelid:Anum_pg_constraint_contypid,BTEqualStrategyNumber,F_OIDEQ,ObjectIdGetDatum(OidIsValid(relation)?relation:domain));
+    scan=systable_beginscan(catalog,InvalidOid,false,NULL,1,&key);
+    while(HeapTupleIsValid(tuple=systable_getnext(scan))) {
+        Form_pg_constraint constraint=(Form_pg_constraint)GETSTRUCT(tuple); Datum binary; bool isnull; Node *expression;
+        if(constraint->contype!=CONSTRAINT_CHECK || !constraint->convalidated || (OidIsValid(relation)&&constraint->connoinherit)) continue;
+#if PG_VERSION_NUM >= 180000
+        if(!constraint->conenforced) continue;
+#endif
+        binary=heap_getattr(tuple,Anum_pg_constraint_conbin,RelationGetDescr(catalog),&isnull);
+        if(isnull) continue;
+        expression=finite_replace(stringToNode(TextDatumGetCString(binary)),&input);
+        result=finite_intersect(result,finite_predicate(target,expression,true,element));
+    }
+    systable_endscan(scan);table_close(catalog,AccessShareLock);return result;
+}
+static FiniteValues finite_domains(Node *target,Oid type,bool element) {
+    FiniteValues result=finite_unknown();
+    while(get_typtype(type)==TYPTYPE_DOMAIN) {
+        HeapTuple tuple;Oid base;
+        result=finite_intersect(result,finite_constraints(target,InvalidOid,0,type,element));
+        tuple=SearchSysCache1(TYPEOID,ObjectIdGetDatum(type));
+        if(!HeapTupleIsValid(tuple)) break;
+        base=((Form_pg_type)GETSTRUCT(tuple))->typbasetype;ReleaseSysCache(tuple);type=base;
+    }
+    return result;
+}
+static FiniteValues finite_expression(Node *target,Query *query,bool element) {
+    FiniteValues result;Node *node=finite_unwrap(target);
+    if(node==NULL) return finite_unknown();
+    result=finite_domains(target,exprType(target),element);
+    if(IsA(node,Var)) {
+        Oid relation;AttrNumber attribute;Index varno;
+        if(resolve_var_column(query,(Var *)node,&relation,&attribute,&varno) && get_rel_relkind(relation)!=RELKIND_FOREIGN_TABLE)
+            result=finite_intersect(result,finite_constraints(target,relation,attribute,InvalidOid,element));
+        if(query->jointree && query->groupingSets==NIL)
+            result=finite_intersect(result,finite_predicate(target,query->jointree->quals,false,element));
+    }
+    return result;
+}
+static void append_finite(StringInfo buffer,FiniteValues values) {
+    ListCell *lc;bool first=true;
+    if(!values.known) {appendStringInfoString(buffer,"null");return;}
+    appendStringInfoChar(buffer,'[');
+    foreach(lc,values.values) {if(!first)appendStringInfoChar(buffer,',');first=false;escape_json(buffer,lfirst(lc));}
+    appendStringInfoChar(buffer,']');
+}
+
 typedef enum JsonShapeKind
 {
     PD_SHAPE_UNKNOWN,
@@ -754,6 +948,7 @@ struct JsonShape
     Oid           source_table;
     char         *source_column;
     int           base_not_null;
+    FiniteValues  finite;
 
     /* array */
     JsonShape    *element;
@@ -1055,7 +1250,8 @@ static bool
 predicate_proves_nonnull(Node *expression, Node *predicate)
 {
     ListCell *lc;
-    if (predicate == NULL) return false;
+    if (predicate == NULL || contain_volatile_functions(expression)) return false;
+    if (finite_predicate(expression,predicate,false,false).known) return true;
     if (IsA(predicate, NullTest))
     {
         NullTest *test = (NullTest *) predicate;
@@ -1361,6 +1557,7 @@ scalar_shape(Node *node, Query *query, Bitmapset *nullable,
 
     shape->runtime_kind = pstrdup(json_runtime_kind(typid));
     shape->type_oid = typid;
+    shape->finite = finite_expression(node, query, false);
     shape->result_not_null = expr_is_not_null(node, query, nullable,
                                               grouping_sets) ? 1 : 0;
 
@@ -2017,6 +2214,8 @@ append_shape_json(StringInfo buffer, JsonShape *shape)
             get_rel_name(shape->source_table) : NULL);
         append_json_string_property(buffer, "source_column",
                                     shape->source_column);
+        appendStringInfoString(buffer, ",\"values\":");
+        append_finite(buffer, shape->finite);
         append_json_nullable(buffer, "base_not_null", shape->base_not_null);
         append_json_nullable(buffer, "result_not_null",
                              shape->result_not_null);
@@ -2247,7 +2446,85 @@ pg_describe(PG_FUNCTION_ARGS)
         describe_columns(rsinfo, query, query->targetList);
     else if (query->commandType != CMD_UTILITY)
         describe_columns(rsinfo, query, query->returningList);
+    else if (query->utilityStmt != NULL && IsA(query->utilityStmt, CallStmt))
+    {
+        TupleDesc result = CallStmtResultDesc((CallStmt *) query->utilityStmt);
+        if (result != NULL)
+        {
+            int index;
+            for (index = 0; index < result->natts; index++)
+            {
+                Form_pg_attribute attribute = TupleDescAttr(result,index);
+                emit_row(rsinfo,"column",index+1,NameStr(attribute->attname),attribute->atttypid,
+                         InvalidOid,NULL,PD_UNKNOWN,PD_UNKNOWN,NULL,PD_UNKNOWN,PD_UNKNOWN);
+            }
+        }
+    }
+
 
     /* Materialize mode returns no Datum; the rows are already in the store. */
     PG_RETURN_NULL();
+}
+
+/* Additional metadata keeps pg_describe's existing row signature compatible. */
+PG_FUNCTION_INFO_V1(pg_describe_facts);
+Datum
+pg_describe_facts(PG_FUNCTION_ARGS)
+{
+    char *sql=text_to_cstring(PG_GETARG_TEXT_PP(0)); List *raw=pg_parse_query(sql); RawStmt *statement;
+    Query *query;Oid *types=NULL;int count=0;StringInfoData json;List *targets=NIL;ListCell *lc;bool first=true;int ord=0;
+    if(list_length(raw)!=1) ereport(ERROR,(errmsg("pg_describe_facts expects exactly one statement")));
+    statement=linitial_node(RawStmt,raw);
+    query=parse_analyze_varparams(statement,sql,&types,&count,NULL);check_permissions(query);
+    initStringInfo(&json);appendStringInfoString(&json,"{\"command\":");
+    escape_json(&json,GetCommandTagName(CreateCommandTag(statement->stmt)));
+    appendStringInfoString(&json,",\"copy\":");
+    if(IsA(statement->stmt,CopyStmt)) {
+        CopyStmt *copy=(CopyStmt *)statement->stmt;const char *format="text";
+        foreach(lc,copy->options) {DefElem *option=lfirst_node(DefElem,lc);if(strcmp(option->defname,"format")==0)format=defGetString(option);}
+        appendStringInfoString(&json,"{\"direction\":");escape_json(&json,copy->is_from?"from":"to");
+        appendStringInfoString(&json,",\"transport\":");escape_json(&json,copy->is_program?"program":copy->filename?"file":"stream");
+        appendStringInfoString(&json,",\"format\":");escape_json(&json,format);appendStringInfoChar(&json,'}');
+        if(copy->query) {
+            RawStmt *inner=makeNode(RawStmt);Oid *inner_types=NULL;int inner_count=0;Query *inner_query;
+            inner->stmt=copy->query;inner_query=parse_analyze_varparams(inner,sql,&inner_types,&inner_count,NULL);check_permissions(inner_query);
+        }
+    } else appendStringInfoString(&json,"null");
+    appendStringInfoString(&json,",\"columns\":[");
+    if(query->commandType==CMD_SELECT) targets=query->targetList;
+    else if(query->commandType!=CMD_UTILITY) targets=query->returningList;
+    foreach(lc,targets) {
+        TargetEntry *target=lfirst_node(TargetEntry,lc);
+        if(target->resjunk)continue;
+        if(!first)appendStringInfoChar(&json,',');
+        first=false;
+        appendStringInfo(&json,"{\"ord\":%d,\"values\":",++ord);
+        append_finite(&json,finite_expression((Node *)target->expr,query,false));
+        appendStringInfoString(&json,",\"element_values\":");append_finite(&json,finite_expression((Node *)target->expr,query,true));
+        appendStringInfoChar(&json,'}');
+    }
+    appendStringInfoString(&json,"]}");
+    PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,CStringGetDatum(json.data)));
+}
+
+PG_FUNCTION_INFO_V1(pg_describe_type_facts);
+Datum
+pg_describe_type_facts(PG_FUNCTION_ARGS)
+{
+    Oid type=PG_GETARG_OID(0);Param *target=makeNode(Param);StringInfoData json;Oid element;
+    AclResult permission=object_aclcheck(TypeRelationId,type,GetUserId(),ACL_USAGE);
+    if(permission!=ACLCHECK_OK) aclcheck_error_type(permission,type);
+    target->paramkind=PARAM_EXTERN;target->paramid=1;target->paramtype=type;target->paramtypmod=-1;target->paramcollid=get_typcollation(type);
+    initStringInfo(&json);appendStringInfoString(&json,"{\"values\":");
+    append_finite(&json,finite_domains((Node *)target,type,false));
+    appendStringInfoString(&json,",\"element_values\":");
+    append_finite(&json,finite_domains((Node *)target,type,true));
+    element=get_element_type(getBaseType(type));
+    appendStringInfoString(&json,",\"element_type_values\":");
+    if(OidIsValid(element)) {
+        Param *scalar=makeNode(Param);scalar->paramkind=PARAM_EXTERN;scalar->paramid=1;scalar->paramtype=element;scalar->paramtypmod=-1;scalar->paramcollid=get_typcollation(element);
+        append_finite(&json,finite_domains((Node *)scalar,element,false));
+    } else appendStringInfoString(&json,"null");
+    appendStringInfoString(&json,"}");
+    PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,CStringGetDatum(json.data)));
 }

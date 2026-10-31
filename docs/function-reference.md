@@ -159,3 +159,33 @@ arguments with defaults. The strict flag is independent of the result proof.
 
 The bulk call shares dependency analysis across routines. It does not invoke
 functions, infer guarantees from sample values, or persist an analysis cache.
+
+
+## Statement and finite-value facts (2.2)
+
+`pg_describe_facts(sql text)` returns a JSON object with the outer `command`,
+optional `copy` direction/transport/format, and an ordered `columns` array. Each
+column carries `ord`, `values`, and `element_values`. A null set is unknown;
+an empty array is a proved empty set of non-null values. SQL NULL remains
+separate and is described by the ordinary nullability metadata.
+
+`pg_describe_type_facts(type_oid oid)` reports `values`, `element_values`, and
+`element_type_values` from validated, enforced domain constraints. It requires
+USAGE on the type. Finite facts cover direct text/varchar/enum equality and
+constant-array membership, compatible CHECK intersections, and text/enum array
+containment. Unknown predicates remain unknown; opaque functions and
+nondeterministic collations never establish exact string-label sets.
+
+CHECK accepts UNKNOWN, so a membership CHECK with a NULL alternative establishes
+no scalar finite set. WHERE accepts only TRUE and can discard that alternative.
+Only facts shared by every OR branch survive; AND intersects available facts.
+Traditional inheritance does not inherit NO INHERIT proofs, and foreign-table
+constraints are not treated as locally enforced facts. Positive WHERE facts
+never prove a non-null result for an empty-input aggregate or a repeated volatile
+expression. JSON scalar shapes carry the same optional `values` proof.
+
+CALL output columns now follow PostgreSQL's procedure result descriptor,
+including OUT/INOUT names and types. No procedure is invoked. Dynamic anonymous
+record output without a static descriptor remains outside this contract.
+COPY metadata describes the parsed transport, not a promise that runtime
+privileges, paths, input bytes, or table constraints will permit execution.
