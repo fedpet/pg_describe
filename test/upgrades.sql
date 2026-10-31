@@ -12,6 +12,11 @@ CREATE TEMP TABLE fresh_definition AS
 SELECT pg_get_functiondef('upgrade_check.pg_describe(text)'::regprocedure) AS definition;
 CREATE TEMP TABLE fresh_function_definition AS
 SELECT pg_get_functiondef('upgrade_check.pg_describe_functions(text[])'::regprocedure) AS definition;
+CREATE TEMP TABLE fresh_facts_definition AS
+SELECT pg_get_functiondef('upgrade_check.pg_describe_facts(text)'::regprocedure) AS definition;
+CREATE TEMP TABLE fresh_type_facts_definition AS
+SELECT pg_get_functiondef('upgrade_check.pg_describe_type_facts(oid)'::regprocedure) AS definition;
+CREATE TEMP TABLE fresh_facts AS SELECT upgrade_check.pg_describe_facts('COPY (SELECT 1) TO STDOUT') AS facts;
 CREATE TEMP TABLE fresh_functions AS
 SELECT function_name, argument_types, return_type, nonnull_when
 FROM upgrade_check.pg_describe_functions(ARRAY['pg_catalog'])
@@ -36,11 +41,17 @@ $$;
 
 CREATE FUNCTION pg_temp.assert_upgrade() RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
-  IF (SELECT extversion FROM pg_extension WHERE extname = 'pg_describe') <> '2.1.0'
+  IF (SELECT extversion FROM pg_extension WHERE extname = 'pg_describe') <> '2.2.0'
     OR pg_get_functiondef('upgrade_check.pg_describe(text)'::regprocedure)
        IS DISTINCT FROM (SELECT definition FROM fresh_definition)
     OR pg_get_functiondef('upgrade_check.pg_describe_functions(text[])'::regprocedure)
        IS DISTINCT FROM (SELECT definition FROM fresh_function_definition)
+    OR pg_get_functiondef('upgrade_check.pg_describe_facts(text)'::regprocedure)
+       IS DISTINCT FROM (SELECT definition FROM fresh_facts_definition)
+    OR pg_get_functiondef('upgrade_check.pg_describe_type_facts(oid)'::regprocedure)
+       IS DISTINCT FROM (SELECT definition FROM fresh_type_facts_definition)
+    OR upgrade_check.pg_describe_facts('COPY (SELECT 1) TO STDOUT')
+       IS DISTINCT FROM (SELECT facts FROM fresh_facts)
     OR EXISTS (
       (SELECT * FROM fresh_functions EXCEPT ALL
        SELECT function_name, argument_types, return_type, nonnull_when
@@ -68,23 +79,23 @@ $$;
 
 DROP EXTENSION pg_describe;
 CREATE EXTENSION pg_describe SCHEMA upgrade_check VERSION '1.0.0';
-ALTER EXTENSION pg_describe UPDATE TO '2.1.0';
+ALTER EXTENSION pg_describe UPDATE TO '2.2.0';
 SELECT pg_temp.assert_upgrade();
 
 DROP EXTENSION pg_describe;
 CREATE EXTENSION pg_describe SCHEMA upgrade_check VERSION '1.1.0';
-ALTER EXTENSION pg_describe UPDATE TO '2.1.0';
+ALTER EXTENSION pg_describe UPDATE TO '2.2.0';
 SELECT pg_temp.assert_upgrade();
 
 DROP EXTENSION pg_describe;
 CREATE EXTENSION pg_describe SCHEMA upgrade_check VERSION '1.0.0';
 ALTER EXTENSION pg_describe UPDATE TO '1.1.0';
-ALTER EXTENSION pg_describe UPDATE TO '2.1.0';
+ALTER EXTENSION pg_describe UPDATE TO '2.2.0';
 SELECT pg_temp.assert_upgrade();
 
 DROP EXTENSION pg_describe;
 CREATE EXTENSION pg_describe SCHEMA upgrade_check VERSION '2.0.0';
-ALTER EXTENSION pg_describe UPDATE TO '2.1.0';
+ALTER EXTENSION pg_describe UPDATE TO '2.2.0';
 SELECT pg_temp.assert_upgrade();
 
 ROLLBACK;

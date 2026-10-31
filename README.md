@@ -22,7 +22,8 @@ JSON shapes, and provable SQL array rank and element nullability. Rewrite,
 planning and execution are never reached.
 `pg_describe_functions` discovers built-in and user routines in bulk and reports
 symbolic non-null guarantees using the same function analysis as query
-description. Access privileges are checked before metadata is returned.
+description. Statement/COPY transport metadata and finite value proofs are exposed
+through `pg_describe_facts` and `pg_describe_type_facts`. Access privileges are checked before metadata is returned.
 
 ## Get started
 
